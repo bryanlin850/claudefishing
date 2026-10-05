@@ -27,6 +27,51 @@ export type HeartbeatRequest = {
    * and the flip to off closes the game window the machine opened. Absent from plugins before 0.3.0.
    */
   fishing?: FishingSwitch
+  /**
+   * What Claude has done in this session, in numbers only, for game mechanics (a server may use it or
+   * not). Rides on the beats the session sends anyway. Absent from plugins before 0.4.0.
+   */
+  work?: WorkReport
+}
+
+/** Token counts by kind, as the API counts them. */
+export type WorkTokens = { input: number; output: number; cacheRead: number; cacheWrite: number }
+
+/**
+ * What Claude has done in a session since `run` began, in numbers only: never a prompt, answer, file,
+ * path, command or tool input. The totals only grow while `run` stays the same, so a server takes the
+ * change since the last report of that run (a lost beat loses nothing, a repeated one adds nothing);
+ * a new `run` starts them over from zero (a /clear or /resume, a reload that lost them).
+ */
+export type WorkReport = {
+  /** A random id for these totals. */
+  run: string
+  /** Model requests answered, the main loop's and subagents' (turn.step). */
+  steps: number
+  /** What they used, summed. */
+  tokens: WorkTokens
+  /** The same by the model that answered ("claude-opus-5-5"), for the first 8 models; requests past those count only above. */
+  byModel: Record<string, WorkTokens & { steps: number }>
+  /** Main-loop turns ended (turn.complete): of them, how many were interrupted and how many ended on an error or a refusal; their wall-clock ms. */
+  turns: { count: number; aborted: number; failed: number; ms: number }
+  /** Subagent runs ended (turn.complete with an agent id). */
+  agentRuns: number
+  /** Tool calls by tool, subagents' included: Claude Code's own by name ("Bash", "Read"), any MCP server's as "mcp", anything else as "other". */
+  tools: Record<string, number>
+  /** The session's latest measure (session.measure); null before the first. */
+  measure: WorkMeasure | null
+}
+
+/** The session's figures as its status line has them, at the last measure. */
+export type WorkMeasure = {
+  /** The context window's fill, 0 to 100; null until a response reported one. */
+  contextPct: number | null
+  /** The context window's size, in tokens. */
+  contextWindow: number
+  /** The plan's rate-limit windows (`five_hour`, `seven_day`, a gateway's `spend_limit`): percent used, and when each resets (ISO 8601); empty off a subscription. */
+  rateLimits: { kind: string; percentUsed: number; resetsAt: string | null }[]
+  /** What the session has cost so far, in US dollars; null where the host keeps no ledger. */
+  costUsd: number | null
 }
 
 /**

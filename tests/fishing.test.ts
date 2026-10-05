@@ -42,6 +42,19 @@ type WorldOptions = {
 
 const IDENTITY = '/home/cat/.claudefishing/identity.json'
 const FISHING_FILE = '/home/cat/.claudefishing/fishing.json'
+const KEEPALIVE_FILE = '/home/cat/.claudefishing/keepalive.json'
+const ANSWER_FILE = '/home/cat/.claudefishing/answer.json'
+/** A work report before anything was counted. */
+const NO_WORK = {
+  run: expect.stringMatching(/^[0-9a-f]{12}$/),
+  steps: 0,
+  tokens: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 },
+  byModel: {},
+  turns: { count: 0, aborted: 0, failed: 0, ms: 0 },
+  agentRuns: 0,
+  tools: {},
+  measure: null,
+}
 const SECRET = 'ab'.repeat(32)
 const TMP = /^\/home\/cat\/\.claudefishing\/identity\.json\.[0-9a-f]{12}\.tmp$/
 
@@ -96,6 +109,8 @@ function world(on: On, opts: WorldOptions = {}) {
   }
   /** How long each tool's call takes (its permission prompt or question included). */
   const toolMs: Record<string, number> = {}
+  /** What the next model requests used, as the API reports it (null: no usage, as the default stub). */
+  const stepUsage: { next: Record<string, unknown> | null } = { next: null }
   /** What the settings hooks beneath answer a permission request with. */
   const permission: { answer: Record<string, unknown> } = { answer: {} }
   /** Runs before a $.fs.write lands: another process acting meanwhile. */
@@ -131,8 +146,9 @@ function world(on: On, opts: WorldOptions = {}) {
   on('turn.start', ($, e) => ({ turnId: e.turnId }))
   on('turn.complete', ($, e) => ({ text: e.answer }))
   on('turn.step', async function* ($, e) {
-    return { turnId: e.turnId, index: e.index, answer: '', toolUses: [], stopReason: 'end_turn' as const, usage: null }
+    return { turnId: e.turnId, index: e.index, answer: '', toolUses: [], stopReason: 'end_turn' as const, usage: stepUsage.next as never }
   })
+  on('session.measure', ($, e) => ({ changed: e.changed }))
   on('tool.call', async ($, e) => {
     const ms = toolMs[e.tool]
     if (ms !== undefined) await clock.sleep(ms)
@@ -216,7 +232,7 @@ function world(on: On, opts: WorldOptions = {}) {
     const text = files.get(FISHING_FILE)
     return text === undefined ? undefined : JSON.parse(text)
   }
-  return { files, state, store, fishing, sent, beats, lastBeat, pairs, to, statuses, toasts, copies, asks, person, argvs, clock, session, server, toolMs, permission, beforeWrite }
+  return { files, state, store, fishing, sent, beats, lastBeat, pairs, to, statuses, toasts, copies, asks, person, argvs, clock, session, server, toolMs, stepUsage, permission, beforeWrite }
 }
 
 const START = { cwd: '/proj', surface: null, isInteractive: false } as const
@@ -249,7 +265,7 @@ describe('identity', () => {
       ['ln', tmp, IDENTITY],
       ['rm', '-f', tmp],
     ])
-    expect([...w.files.keys()]).toEqual([IDENTITY])
+    expect([...w.files.keys()].filter(path => path.includes('identity'))).toEqual([IDENTITY])
     expect(w.beats()[0]?.url).toBe('https://claudefishing.io/api/heartbeat')
     expect(w.beats()[0]?.auth).toBe(`Bearer ${identity.secret}`)
   })
@@ -283,7 +299,7 @@ describe('identity', () => {
     await $.session.start(START)
     await w.clock.settle()
     expect(w.files.get(IDENTITY)).toBe(theirs)
-    expect([...w.files.keys()]).toEqual([IDENTITY])
+    expect([...w.files.keys()].filter(path => path.includes('identity'))).toEqual([IDENTITY])
     expect(w.beats()[0]?.auth).toBe(`Bearer ${SECRET}`)
   })
 
@@ -316,6 +332,7 @@ describe('heartbeats', () => {
       activeAgoMs: null,
       modVersion: MOD_VERSION,
       fishing: { on: true, rev: 0 },
+      work: NO_WORK,
     })
   })
 
@@ -688,6 +705,189 @@ describe('status line', () => {
   })
 })
 
+describe('one keepalive per machine', () => {
+  /** Another session of the machine beats: it stamps the keepalive first, then shares its answer (newer than any before it). */
+  function otherBeat(w: ReturnType<typeof world>, answer: Partial<HeartbeatResponse> = {}): void {
+    const at = w.clock.now()
+    w.files.set(KEEPALIVE_FILE, `${JSON.stringify({ at, sessionId: 'other' })}\n`)
+    const shared = { ...heartbeatResponse(w.server), serverTime: 5_000_001 + (at - 1_000_000), ...answer }
+    w.files.set(ANSWER_FILE, `${JSON.stringify({ at, modVersion: MOD_VERSION, answer: shared })}\n`)
+  }
+
+  test('an idle session stays quiet while another session of the machine beats, and keeps it alive once none has for a minute', async ($, on) => {
+    const w = world(on)
+    await $.session.start(START)
+    await w.clock.settle()
+    expect(w.beats()).toHaveLength(1)
+    for (let i = 0; i < 10; i++) {
+      otherBeat(w)
+      await w.clock.advance(30_000)
+    }
+    expect(w.beats()).toHaveLength(1)
+    // The other goes quiet too: the first tick a minute after its last beat keeps the machine alive.
+    const last = w.clock.now() - 30_000
+    await w.clock.advance(35_000)
+    expect(w.beats().map(b => b.at)).toEqual([1_000_000, last + 60_000])
+    expect(JSON.parse(w.files.get(KEEPALIVE_FILE)!)).toEqual({ at: last + 60_000, sessionId: 'sess-1' })
+  })
+
+  test('a session Claude worked in keeps itself alive through the buff window, then leaves it to the machine', async ($, on) => {
+    const w = world(on)
+    await $.session.start(START)
+    await $.turn.start({ text: 'hi', turnId: 't1' })
+    await $.turn.complete({ ...DONE, turnId: 't1' })
+    await w.clock.settle()
+    const count = w.beats().length
+    for (let i = 0; i < 16; i++) {
+      otherBeat(w)
+      await w.clock.advance(30_000)
+    }
+    // Each minute while the 5 minutes after the turn last, whatever the others do; then not at all.
+    expect(w.beats().slice(count).map(b => [b.at - 1_000_000, b.body.activeAgoMs])).toEqual([
+      [60_000, 60_000],
+      [120_000, 120_000],
+      [180_000, 180_000],
+      [240_000, 240_000],
+    ])
+  })
+
+  test("a quiet session's status line follows the newest answer any session of the machine got", async ($, on) => {
+    const w = world(on)
+    await $.session.start(START)
+    await w.clock.settle()
+    expect(w.statuses.at(-1)).toBe('🎣 game closed')
+    const buff = { active: true, pct: 0.04, potentialPct: 0.04, expiresAt: null }
+    otherBeat(w, { clientConnected: true, presence: { ...heartbeatResponse(w.server).presence, buff } })
+    await w.clock.advance(5_000)
+    expect(w.statuses.at(-1)).toBe('🎣 in game · ⚡+4%')
+    expect(w.beats()).toHaveLength(1)
+    // An older answer changes nothing.
+    w.files.set(ANSWER_FILE, JSON.stringify({ at: w.clock.now(), modVersion: MOD_VERSION, answer: heartbeatResponse(w.server) }))
+    await w.clock.advance(5_000)
+    expect(w.statuses.at(-1)).toBe('🎣 in game · ⚡+4%')
+  })
+
+  test("an answer to another version of the plugin keeps this session's own word on updates", async ($, on) => {
+    const w = world(on)
+    await $.session.start(START)
+    await w.clock.settle()
+    const modUpdate: ModUpdate = { required: false, latest: '9.9.9', min: null, command: 'update it' }
+    w.files.set(ANSWER_FILE, JSON.stringify({ at: w.clock.now(), modVersion: '0.3.0', answer: { ...heartbeatResponse(w.server), serverTime: 5_000_001, modUpdate } }))
+    await w.clock.advance(5_000)
+    expect(w.statuses.at(-1)).toBe('🎣 game closed')
+    expect(w.toasts).toEqual([])
+    w.files.set(ANSWER_FILE, JSON.stringify({ at: w.clock.now(), modVersion: MOD_VERSION, answer: { ...heartbeatResponse(w.server), serverTime: 5_000_002, modUpdate } }))
+    await w.clock.advance(5_000)
+    expect(w.statuses.at(-1)).toBe('🎣 game closed · update available')
+    expect(w.toasts).toEqual([`🎣 claudefishing ${MOD_VERSION}: 9.9.9 is out. Update in a terminal: update it`])
+  })
+
+  test('no session of the machine getting an answer for a session lifetime: a quiet session says offline, until one does', async ($, on) => {
+    const w = world(on)
+    await $.session.start(START)
+    await w.clock.settle()
+    // Another session keeps trying (its stamps) and gets nothing through.
+    for (let i = 0; i < 6; i++) {
+      w.files.set(KEEPALIVE_FILE, `${JSON.stringify({ at: w.clock.now(), sessionId: 'other' })}\n`)
+      await w.clock.advance(30_000)
+    }
+    expect(w.beats()).toHaveLength(1)
+    expect(w.statuses.at(-1)).toBe('🎣 offline')
+    otherBeat(w)
+    await w.clock.advance(5_000)
+    expect(w.statuses.at(-1)).toBe('🎣 game closed')
+  })
+})
+
+describe('what Claude did', () => {
+  test('model requests, turns, subagent runs and tool calls ride on the beats as totals, numbers only', async ($, on) => {
+    const w = world(on)
+    await $.session.start(START)
+    await $.turn.start({ text: 'hi', turnId: 't1' })
+    w.stepUsage.next = { model: 'claude-opus-5-5', input_tokens: 10, output_tokens: 200, cache_read_input_tokens: 5_000, cache_creation_input_tokens: 300 }
+    for await (const chunk of $.turn.step({ turnId: 't1', index: 0, model: 'claude-opus-5-5', effort: 'high', messageCount: 1 })) void chunk
+    await $.tool.call({ tool: 'Bash', command: 'ls' } as never)
+    await $.tool.call({ tool: 'Bash', command: 'pwd' } as never)
+    // Neither the MCP server nor a plugin's tool is named.
+    await $.tool.call({ tool: 'mcp__slack__post_message', text: 'hi' } as never)
+    await $.tool.call({ tool: 'some_plugin_tool' } as never)
+    w.stepUsage.next = { model: 'claude-haiku-4-5', input_tokens: 1, output_tokens: 20, cache_read_input_tokens: 0, cache_creation_input_tokens: 0 }
+    for await (const chunk of $.turn.step({ turnId: 's1', index: 0, model: 'claude-haiku-4-5', messageCount: 1, agentId: 'a1' })) void chunk
+    await $.turn.complete({ ...DONE, turnId: 's1', agentId: 'a1' })
+    await $.turn.complete({ ...DONE, turnId: 't1', durationMs: 4_000 })
+    await w.clock.settle()
+    expect(w.lastBeat()).toEqual(expect.objectContaining({ working: false }))
+    expect(w.lastBeat()?.work).toEqual({
+      ...NO_WORK,
+      steps: 2,
+      tokens: { input: 11, output: 220, cacheRead: 5_000, cacheWrite: 300 },
+      byModel: {
+        'claude-opus-5-5': { steps: 1, input: 10, output: 200, cacheRead: 5_000, cacheWrite: 300 },
+        'claude-haiku-4-5': { steps: 1, input: 1, output: 20, cacheRead: 0, cacheWrite: 0 },
+      },
+      turns: { count: 1, aborted: 0, failed: 0, ms: 4_000 },
+      agentRuns: 1,
+      tools: { Bash: 2, mcp: 1, other: 1 },
+    })
+  })
+
+  test("the latest measure rides along (context fill, plan limits, cost), and is not Claude's activity", async ($, on) => {
+    const w = world(on)
+    await $.session.start(START)
+    await w.clock.settle()
+    await $.session.measure({
+      context: { window: 200_000, tokens: 84_000, percent: 42 },
+      rateLimits: [
+        { kind: 'five_hour', percentUsed: 23.5, resetsAt: '2026-10-05T20:00:00.000Z' },
+        { kind: 'seven_day', percentUsed: 7 },
+      ],
+      cost: { usd: 1.25 },
+      changed: ['context', 'rateLimits', 'cost'],
+    })
+    await w.clock.advance(60_000)
+    expect(w.beats()).toHaveLength(2)
+    expect(w.lastBeat()).toEqual(expect.objectContaining({ activeAgoMs: null }))
+    expect(w.lastBeat()?.work).toEqual({
+      ...NO_WORK,
+      measure: {
+        contextPct: 42,
+        contextWindow: 200_000,
+        rateLimits: [
+          { kind: 'five_hour', percentUsed: 23.5, resetsAt: '2026-10-05T20:00:00.000Z' },
+          { kind: 'seven_day', percentUsed: 7, resetsAt: null },
+        ],
+        costUsd: 1.25,
+      },
+    })
+  })
+
+  test("a hot reload goes on counting the same run; /clear starts a new one, and the old conversation's end carries its totals", async ($, on) => {
+    const kept = {
+      run: 'abcdefabcdef',
+      steps: 5,
+      tokens: { input: 1, output: 2, cacheRead: 3, cacheWrite: 4 },
+      byModel: {},
+      turns: { count: 1, aborted: 0, failed: 0, ms: 9 },
+      agentRuns: 0,
+      tools: { Read: 2 },
+      measure: null,
+    }
+    const w = world(on, { state: { work: kept } })
+    await $.session.start(START)
+    await w.clock.settle()
+    expect(w.lastBeat()?.work).toEqual(kept)
+    await $.tool.call({ tool: 'Read', file_path: '/x' } as never)
+    await w.clock.settle()
+    await $.session.end({ reason: 'clear', sessionId: 'sess-1', resume: { id: 'sess-1' } })
+    await w.clock.settle()
+    const [first, ending] = w.beats().slice(-2).map(b => b.body)
+    expect(first).toEqual(expect.objectContaining({ sessionId: 'sess-2', work: NO_WORK }))
+    expect((first!.work as { run: string }).run).not.toBe(kept.run)
+    expect(ending).toEqual(expect.objectContaining({ sessionId: 'sess-1', ending: true, work: { ...kept, tools: { Read: 3 } } }))
+    expect(w.state.get('work')).toEqual(first!.work)
+  })
+})
+
 describe('/fishing', () => {
   test('status (no argument) lists the link, game, model, effort, buff, sessions and identity path', async ($, on) => {
     const w = world(on)
@@ -701,9 +901,9 @@ describe('/fishing', () => {
         'game: closed (/fishing open)',
         'player: Mochi · level 3 Driftwood · $120',
         'devices: this one only (/fishing link plays Mochi on another too)',
-        'sessions: 2 live on this machine · shown as Opus 5.5 · high',
+        'sessions: 2 reporting on this machine (idle ones stay quiet) · shown as Opus 5.5 · high',
         'buff: ⚡+12%, 3 min left',
-        'this session: model claude-opus-5-5 · effort not known until a turn runs',
+        'this session: model claude-opus-5-5 · effort not known until a turn runs · idle',
         `identity: ${IDENTITY} (stays on this machine)`,
         'usage: /fishing [status|open|on|off|link [code]|unlink]',
       ].join('\n'),
@@ -1107,7 +1307,7 @@ describe('linking devices', () => {
     w.server.linked = true
     await $.session.start(START)
     const linkedText = (await $.command.run({ command: 'fishing', args: '', ...TYPED })).text
-    expect(linkedText).toContain('\ndevices: 3 play Mochi, this one linked (/fishing unlink leaves)\nsessions: 1 live across 3 devices · ')
+    expect(linkedText).toContain('\ndevices: 3 play Mochi, this one linked (/fishing unlink leaves)\nsessions: 1 reporting across 3 devices (idle ones stay quiet) · ')
     w.server.linked = false
     const ownText = (await $.command.run({ command: 'fishing', args: 'status', ...TYPED })).text
     expect(ownText).toContain('\ndevices: 3 play Mochi (/fishing link adds another)\n')

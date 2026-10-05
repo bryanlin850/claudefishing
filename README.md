@@ -164,7 +164,7 @@ The status line shows one of:
 | `🎣 in game` | the server answers and a game window is connected |
 | `🎣 opening game` | this session just opened the game and its window has not joined yet (at most 45 s) |
 | `🎣 game closed` | the server answers, no game window (`/fishing open`) |
-| `🎣 offline` | the server did not answer (the game stays locked unless another session reaches it) |
+| `🎣 offline` | the server did not answer, or no session on the machine got an answer for 2½ minutes (the game stays locked unless another session reaches it) |
 | `🎣 off` | `/fishing off` |
 
 plus ` · ⚡+11%` while the buff is on.
@@ -192,9 +192,14 @@ on the same machine) with `Authorization: Bearer <secret>`.
   (Claude starts or stops working or starts waiting on you, the model or
   effort changes, activity after 5 idle minutes), every 5 s for up to 45 s
   after the session opens the game (until the answer says its window joined),
-  else as a keepalive once nothing was sent for 60 s, once when the session
-  ends, and once when fishing goes off (again a minute later while the server
-  does not answer it):
+  once when the session ends, and once when fishing goes off (again a minute
+  later while the server does not answer it). Otherwise as a keepalive once
+  nothing was sent for 60 s, but only from a session Claude worked in during
+  the last 5 minutes (the buff's window). An idle session stays quiet unless
+  no session on the machine has sent a heartbeat for 60 s, so forty idle
+  threads keep the game open with one heartbeat a minute, not forty. Quiet
+  sessions' status lines show the last answer any session on the machine got.
+  Each heartbeat carries:
 
   | Field | |
   | --- | --- |
@@ -207,7 +212,28 @@ on the same machine) with `Authorization: Bearer <secret>`.
   | `activeAgoMs` | milliseconds since Claude last started a turn, made a model request, called a tool, got a tool's result or finished a turn; null before any |
   | `modVersion` | this plugin's version (a server may refuse versions older than its minimum) |
   | `fishing` | the machine's switch, `{ on, rev }`: `rev` counts the flips, so the server keeps the newest. The answer has the server's, which wins when newer (the file was lost, say) |
+  | `work` | what Claude has done in the session, as totals (below), for game mechanics; the game may use them or not |
 
+  `work` holds numbers only, totals since its random `run` id began, which
+  only grow (a `/clear` or `/resume` starts a new run):
+
+  * model requests answered, the main loop's and subagents', and their
+    tokens by kind (input, output, cache read, cache write), also by the
+    model that answered (`claude-opus-5-5`), for up to 8 models;
+  * main-loop turns ended, of them how many you interrupted and how many
+    ended on an error or a refusal, and their total length; subagent runs
+    ended;
+  * tool calls by tool: Claude Code's own tools by name (`Bash`, `Read`,
+    `Edit` …), every MCP tool as `mcp` and anything else as `other`, never
+    which server, plugin, command, file or input;
+  * the status line's figures at the last measure: how full the context window
+    is and its size, your plan's rate-limit windows (percent used and when each
+    resets), and what the session has cost so far.
+
+* **The machine's keepalive and last answer**, beside the identity and never
+  sent anywhere: `~/.claudefishing/keepalive.json` (`{ at, sessionId }`,
+  stamped before every heartbeat) and `~/.claudefishing/answer.json` (the last
+  heartbeat answer, which quiet sessions show).
 * **`POST /api/pair`** `{ sessionId, reason: 'auto' | 'manual' }` when the game
   is opened. The server skips `auto` while fishing is off on the machine;
   `manual` (`/fishing open`) turns it on.

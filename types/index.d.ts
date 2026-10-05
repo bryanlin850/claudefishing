@@ -25,12 +25,32 @@ export type FishingTurn = {
 /** pending: the auto-open could not reach the server and is tried again; done: the server answered it. */
 export type AutoOpenState = 'pending' | 'done'
 
+/** What Claude did in this session, as every heartbeat carries it (protocol.ts's WorkReport); kept in $.state so a hot reload goes on counting. */
+export type FishingWork = {
+  run: string
+  steps: number
+  tokens: FishingTokens
+  byModel: Record<string, FishingTokens & { steps: number }>
+  turns: { count: number; aborted: number; failed: number; ms: number }
+  agentRuns: number
+  tools: Record<string, number>
+  measure: {
+    contextPct: number | null
+    contextWindow: number
+    rateLimits: { kind: string; percentUsed: number; resetsAt: string | null }[]
+    costUsd: number | null
+  } | null
+}
+
+export type FishingTokens = { input: number; output: number; cacheRead: number; cacheWrite: number }
+
 declare module 'claude-code' {
   interface PluginState {
     'claudefishing': {
       activity: FishingActivity
       turn: FishingTurn
       autoOpen: AutoOpenState
+      work: FishingWork
     }
   }
 }

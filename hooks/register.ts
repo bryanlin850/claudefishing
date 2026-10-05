@@ -9,8 +9,19 @@
 // flip is numbered, every heartbeat carries the switch, and the server keeps
 // each machine's newest: while it is off, no session of the machine counts,
 // not even one running an older plugin that never reads the file.
+//
+// Only sessions Claude works in count for the buff, so only they keep
+// themselves alive: while a turn runs and for the buff window after it. An
+// idle session stays quiet unless no session of the machine has beaten for a
+// keepalive (another file beside the identity), so a machine with forty
+// threads open keeps the game open with one keepalive, not forty. Quiet
+// sessions show the last answer any session of the machine got.
+//
+// Every heartbeat also carries what Claude did in the session, as totals of
+// numbers (model requests and their tokens, turns, tool calls, the status
+// line's figures), for game mechanics; nothing Claude read or wrote.
 
-import type { EngineInterface, Register } from 'claude-code'
+import type { EngineInterface, Register, SessionMeasureInput, TurnCompleteInput, TurnStepResult, TurnUsage } from 'claude-code'
 import { MOD_VERSION } from '../types/version'
 
 import type { FishingActivity, FishingStep, FishingTurn } from '../types'
@@ -26,6 +37,9 @@ import type {
   PlayerSummary,
   UnlinkRequest,
   UnlinkResponse,
+  WorkMeasure,
+  WorkReport,
+  WorkTokens,
 } from '../types/protocol'
 
 const DEFAULT_SERVER_URL = 'https://claudefishing.io' // npm run dev:sync swaps in the dev server in its copy only
@@ -35,8 +49,13 @@ const DEFAULT_SERVER_URL = 'https://claudefishing.io' // npm run dev:sync swaps 
 // on this machine only: every request carries the machine's secret, and a project's settings can set
 // environment variables, so nothing in them may send it anywhere but the game.
 
-/** Every change is sent at once (queueBeat); with none, the server still hears from the session this often. */
+/**
+ * Every change is sent at once (queueBeat); with none, the server still hears this often from a
+ * session Claude worked in within the buff window, and from the machine (any idle session) otherwise.
+ */
 const KEEPALIVE_MS = 60_000
+/** Mirrors the server's presence.sessionTtlMs: no answer on the whole machine for this long, and a quiet session says offline. */
+const ANSWER_STALE_MS = 150_000
 /** How often the session checks, without the network, whether a keepalive is due or a turn went stale. */
 const TICK_MS = 5_000
 /** After this session opens the game, every tick beats until the server sees the window join, for at most this long. */
@@ -64,11 +83,15 @@ const PROMPT_NOTIFICATION = /permission_prompt|idle_prompt|elicitation(_url)?_di
 /** Tools whose call lasts until the person answers. */
 const ASKS_USER = new Set(['AskUserQuestion', 'ExitPlanMode'])
 const USAGE = 'usage: /fishing [status|open|on|off|link [code]|unlink]'
+/** Models and tools a work report keeps apart: past these, a request counts in the totals only, a tool as "other". */
+const WORK_MODELS = 8
+const WORK_TOOLS = 40
 
 // Session-scoped values that survive hot reloads (module variables do not).
 const ACTIVITY = { plugin: 'claudefishing', key: 'activity' } as const
 const TURN = { plugin: 'claudefishing', key: 'turn' } as const
 const AUTO_OPEN = { plugin: 'claudefishing', key: 'autoOpen' } as const
+const WORK = { plugin: 'claudefishing', key: 'work' } as const
 
 type Identity = { secret: string; createdAt: number }
 
@@ -98,9 +121,17 @@ type Runtime = {
   identityNote: string | null
   activity: FishingActivity
   turn: FishingTurn
+  /** What Claude did in this session, as every beat carries it. */
+  work: WorkReport
   lastSentWorking: boolean | null
   /** When this session last sent a heartbeat: the next keepalive is due KEEPALIVE_MS after it. */
   lastBeatAt: number | null
+  /** ~/.claudefishing/keepalive.json: when any session of the machine last beat. */
+  keepalivePath: string | null
+  /** ~/.claudefishing/answer.json: the last answer any session of the machine got. */
+  answerPath: string | null
+  /** When this session last got an answer, or took one from answer.json. */
+  answeredAt: number | null
   /** The plugin version an update toast was shown for (once each). */
   updateToastFor: string | null
   link: Link
@@ -406,6 +437,7 @@ async function heartbeatBody($: EngineInterface, rt: Runtime, sessionId: string,
     activeAgoMs: lastActiveAt === null ? null : Math.max(0, now - lastActiveAt),
     modVersion: MOD_VERSION,
     fishing: { on: rt.fishing.on, rev: rt.fishing.rev },
+    work: rt.work,
   }
 }
 
@@ -451,6 +483,8 @@ async function beat($: EngineInterface, rt: Runtime): Promise<void> {
   if (isRecentlyEnded(rt, sessionId, now) || !rt.enabled) return // session.end or /fishing off ran meanwhile
   rt.lastSentWorking = body.working
   rt.lastBeatAt = now
+  // Before it goes, so idle sessions ticking meanwhile leave the machine's keepalive to this beat.
+  await stampKeepalive($, rt, sessionId, now).catch(() => undefined)
   const seq = ++rt.sentSeq
   const request = postJson($, rt, '/api/heartbeat', identity.secret, body, HTTP_TIMEOUT_MS)
   rt.inFlight = request
@@ -459,6 +493,10 @@ async function beat($: EngineInterface, rt: Runtime): Promise<void> {
   if (seq < rt.appliedSeq || !rt.enabled) return
   rt.appliedSeq = seq
   const res = applyReply(rt, reply)
+  if (res !== null) {
+    rt.answeredAt = now
+    await shareAnswer($, rt, now, res).catch(() => undefined)
+  }
   // The server has a newer switch: off, this session goes quiet at once (the server already said so).
   if (res !== null && (await adoptServerSwitch($, rt, res.fishing).catch(() => false)) && !rt.fishing.on) {
     stopReporting(rt, rt.fishing.rev)
@@ -499,10 +537,95 @@ function queueBeat($: EngineInterface, rt: Runtime): void {
   })
 }
 
-// A keepalive once the server has heard nothing for KEEPALIVE_MS, a beat as soon as a turn goes
-// stale (STALE_TURN_MS) and stops counting as work, and one every tick while a window this session
-// opened has not joined (the server only says so in a beat's answer). The switch is read every tick
-// (no network): a flip anywhere on the machine reaches this session within one.
+// ─── one keepalive per machine ─────────────────────────────────────────────
+// The game needs two things of a machine: that Claude Code is open on it, and which sessions
+// Claude worked in within the buff window. Every beat is stamped in keepalive.json before it goes,
+// and an idle session keeps the machine alive only when that stamp is a keepalive old; every answer
+// lands in answer.json, which the quiet sessions' status lines follow. Both are written in place:
+// a torn read costs one extra beat, or one tick of an older status line.
+
+type SharedAnswer = { at: number; modVersion: string; answer: HeartbeatResponse }
+
+/** Claude works in this session, or did within the buff window: the server counts it for the buff, so it keeps itself alive. */
+function isReporting(rt: Runtime, now: number): boolean {
+  const last = rt.activity.lastActiveAt
+  return isWorking(rt, now) || (last !== null && now - last < INACTIVE_MS)
+}
+
+/** When any session of the machine last beat; null with no stamp, or one that does not read. */
+async function readKeepalive($: EngineInterface, rt: Runtime): Promise<number | null> {
+  rt.keepalivePath ??= `${await homeDir($)}/keepalive.json`
+  try {
+    if (!(await $.fs.exists(rt.keepalivePath))) return null
+    const { at } = JSON.parse(await $.fs.read(rt.keepalivePath)) as { at?: unknown }
+    return typeof at === 'number' && Number.isFinite(at) ? at : null
+  } catch {
+    return null
+  }
+}
+
+async function stampKeepalive($: EngineInterface, rt: Runtime, sessionId: string, now: number): Promise<void> {
+  rt.keepalivePath ??= `${await homeDir($)}/keepalive.json`
+  await $.fs.write(rt.keepalivePath, `${JSON.stringify({ at: now, sessionId })}\n`)
+}
+
+/** The last answer any session of the machine got; null with none, or one that does not read. */
+async function readAnswer($: EngineInterface, rt: Runtime): Promise<SharedAnswer | null> {
+  rt.answerPath ??= `${await homeDir($)}/answer.json`
+  try {
+    if (!(await $.fs.exists(rt.answerPath))) return null
+    const shared = JSON.parse(await $.fs.read(rt.answerPath)) as Partial<SharedAnswer> | null
+    const answer = asHeartbeatResponse(shared?.answer)
+    if (answer === null || typeof answer.serverTime !== 'number' || typeof shared?.at !== 'number' || typeof shared.modVersion !== 'string') return null
+    return { at: shared.at, modVersion: shared.modVersion, answer }
+  } catch {
+    return null
+  }
+}
+
+async function shareAnswer($: EngineInterface, rt: Runtime, now: number, answer: HeartbeatResponse): Promise<void> {
+  rt.answerPath ??= `${await homeDir($)}/answer.json`
+  await $.fs.write(rt.answerPath, `${JSON.stringify({ at: now, modVersion: MOD_VERSION, answer } satisfies SharedAnswer)}\n`)
+}
+
+/** Its own keepalive while the server counts it for the buff; past that, the machine's, once no session has beaten for one. */
+async function isKeepaliveDue($: EngineInterface, rt: Runtime, now: number): Promise<boolean> {
+  if (rt.lastBeatAt !== null && now - rt.lastBeatAt < KEEPALIVE_MS) return false
+  if (isReporting(rt, now)) return true
+  const machineAt = await readKeepalive($, rt)
+  return machineAt === null || now - machineAt >= KEEPALIVE_MS
+}
+
+// A quiet session shows the newest answer of the machine. With none for a session's lifetime on the
+// server, no session of the machine reaches the game: offline, as the one trying to will be.
+async function followAnswer($: EngineInterface, rt: Runtime, now: number): Promise<void> {
+  const shared = await readAnswer($, rt)
+  if (shared !== null && shared.answer.serverTime > (rt.last?.serverTime ?? -Infinity)) {
+    // An answer to another version of the plugin says nothing about this one's updates.
+    const modUpdate = shared.modVersion === MOD_VERSION ? (shared.answer.modUpdate ?? null) : (rt.last?.modUpdate ?? null)
+    rt.last = { ...shared.answer, modUpdate }
+    rt.link = 'online'
+    rt.linkError = null
+    rt.answeredAt = shared.at
+    if (rt.last.clientConnected) rt.openingUntil = null
+    $.ui.status(statusLine(rt))
+    toastUpdate($, rt)
+    if (rt.isAutoOpenPending) void autoOpenSafely($, rt)
+    return
+  }
+  const answeredAt = Math.max(rt.answeredAt ?? -Infinity, shared?.at ?? -Infinity)
+  if (rt.link === 'online' && now - answeredAt > ANSWER_STALE_MS) {
+    rt.link = 'offline'
+    rt.linkError = 'no session on this machine got an answer lately'
+    $.ui.status(statusLine(rt))
+  }
+}
+
+// A keepalive once one is due (isKeepaliveDue), a beat as soon as a turn goes stale (STALE_TURN_MS)
+// and stops counting as work, and one every tick while a window this session opened has not joined
+// (the server only says so in a beat's answer); otherwise the status line follows the machine's
+// answers. The switch is read every tick (no network): a flip anywhere on the machine reaches this
+// session within one.
 async function tick($: EngineInterface, rt: Runtime): Promise<void> {
   const now = await $.clock.now()
   if (rt.openingUntil !== null && now >= rt.openingUntil) {
@@ -517,7 +640,7 @@ async function tick($: EngineInterface, rt: Runtime): Promise<void> {
     return
   }
   const isStale = rt.lastSentWorking === true && !isWorking(rt, now)
-  if (rt.openingUntil === null && !isStale && rt.lastBeatAt !== null && now - rt.lastBeatAt < KEEPALIVE_MS) return
+  if (rt.openingUntil === null && !isStale && !(await isKeepaliveDue($, rt, now))) return followAnswer($, rt, now).catch(() => undefined)
   // Counted as a beat even if it cannot be sent (offline): the next try is a keepalive later.
   rt.lastBeatAt = now
   await runBeat($, rt)
@@ -556,24 +679,30 @@ async function turnOff($: EngineInterface, rt: Runtime): Promise<void> {
   await adoptServerSwitch($, rt, asHeartbeatResponse(reply.json)?.fishing).catch(() => false)
 }
 
-async function sendEnding($: EngineInterface, rt: Runtime, sessionId: string, timeoutMs: number): Promise<void> {
+/** `work`: the ended conversation's totals (after a /clear, this process already counts the next one's). */
+async function sendEnding($: EngineInterface, rt: Runtime, sessionId: string, timeoutMs: number, work: WorkReport = rt.work): Promise<void> {
   const now = await $.clock.now()
   markEnded(rt, sessionId, now)
   const identity = rt.identity
   if (!rt.enabled || identity === null) return
   const body = await heartbeatBody($, rt, sessionId, now)
-  await postJson($, rt, '/api/heartbeat', identity.secret, { ...body, working: false, ending: true }, timeoutMs)
+  await postJson($, rt, '/api/heartbeat', identity.secret, { ...body, work, working: false, ending: true }, timeoutMs)
 }
 
 // After a /clear or an in-session /resume the process goes on as another conversation: beat as it
-// first, then end the old id, so the server never sees this machine without a session.
-async function switchSession($: EngineInterface, rt: Runtime, endedId: string): Promise<void> {
+// first, then end the old id (with its totals), so the server never sees this machine without a session.
+async function switchSession($: EngineInterface, rt: Runtime, endedId: string, endedWork: WorkReport): Promise<void> {
   let sessionId = await $.session.id()
   for (let i = 0; sessionId === endedId && i < SWITCH_POLLS; i++) {
     await $.clock.sleep(SWITCH_POLL_MS)
     sessionId = await $.session.id()
   }
-  if (sessionId === endedId) return runBeat($, rt) // still the same conversation: nothing to end
+  if (sessionId === endedId) {
+    // Still the same conversation: nothing to end, and its totals go on.
+    rt.work = endedWork
+    await $.state.set(WORK, rt.work).catch(() => undefined)
+    return runBeat($, rt)
+  }
   const endedAt = rt.endedAt.get(sessionId)
   if (endedAt !== undefined) {
     // Back to a conversation ended moments ago: the server ignores its beats until its tombstone passes.
@@ -582,12 +711,12 @@ async function switchSession($: EngineInterface, rt: Runtime, endedId: string): 
     rt.endedAt.delete(sessionId)
   }
   await runBeat($, rt)
-  await sendEnding($, rt, endedId, HTTP_TIMEOUT_MS)
+  await sendEnding($, rt, endedId, HTTP_TIMEOUT_MS, endedWork)
 }
 
-async function switchSessionSafely($: EngineInterface, rt: Runtime, endedId: string): Promise<void> {
+async function switchSessionSafely($: EngineInterface, rt: Runtime, endedId: string, endedWork: WorkReport): Promise<void> {
   try {
-    await switchSession($, rt, endedId)
+    await switchSession($, rt, endedId, endedWork)
   } catch {
     // the timer beats as the new id; the server's TTL drops the old one
   }
@@ -645,6 +774,115 @@ async function switchModelSafely($: EngineInterface, rt: Runtime, model: string)
     await switchModel($, rt, model)
   } catch {
     // the next step reports the model
+  }
+}
+
+// ─── what Claude did ───────────────────────────────────────────────────────
+// Totals for game mechanics, on the beats the session sends anyway (the server may use them or not):
+// numbers only, never what Claude read or wrote. Kept in $.state, so a hot reload goes on counting
+// the same run; a /clear or /resume starts a new one.
+
+function noTokens(): WorkTokens {
+  return { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 }
+}
+
+function newWork(): WorkReport {
+  return {
+    run: hex(crypto.getRandomValues(new Uint8Array(6))),
+    steps: 0,
+    tokens: noTokens(),
+    byModel: {},
+    turns: { count: 0, aborted: 0, failed: 0, ms: 0 },
+    agentRuns: 0,
+    tools: {},
+    measure: null,
+  }
+}
+
+/** The totals a previous load of the module kept, with any field it did not have yet at zero. */
+function restoreWork(kept: Partial<WorkReport> | undefined): WorkReport {
+  if (typeof kept?.run !== 'string') return newWork()
+  const fresh = newWork()
+  return {
+    ...fresh,
+    ...kept,
+    run: kept.run,
+    tokens: { ...fresh.tokens, ...kept.tokens },
+    byModel: { ...kept.byModel },
+    turns: { ...fresh.turns, ...kept.turns },
+    tools: { ...kept.tools },
+  }
+}
+
+/** A count from the engine; anything not a finite, non-negative number counts as none. */
+function amount(value: unknown): number {
+  return typeof value === 'number' && Number.isFinite(value) && value > 0 ? value : 0
+}
+
+function addTokens(to: WorkTokens, usage: TurnUsage): void {
+  to.input += amount(usage.input_tokens)
+  to.output += amount(usage.output_tokens)
+  to.cacheRead += amount(usage.cache_read_input_tokens)
+  to.cacheWrite += amount(usage.cache_creation_input_tokens)
+}
+
+/** A tool as the game hears of it: Claude Code's own by name, never which MCP server or plugin. */
+function toolKind(tool: string): string {
+  if (tool.startsWith('mcp__')) return 'mcp'
+  return /^[A-Z][A-Za-z]{0,39}$/.test(tool) ? tool : 'other'
+}
+
+/** A response's model and tokens; a request no response answered counts for nothing. */
+function countStep(work: WorkReport, result: TurnStepResult): void {
+  if (result.stopReason === null && result.usage === null) return
+  work.steps += 1
+  const usage = result.usage
+  if (usage === null) return
+  addTokens(work.tokens, usage)
+  const model = typeof usage.model === 'string' && /^[a-z0-9][a-z0-9.:@-]{0,99}$/i.test(usage.model) ? usage.model : 'other'
+  const byModel = work.byModel[model] ?? (Object.keys(work.byModel).length < WORK_MODELS ? (work.byModel[model] = { steps: 0, ...noTokens() }) : null)
+  if (byModel === null) return
+  byModel.steps += 1
+  addTokens(byModel, usage)
+}
+
+function countTool(work: WorkReport, tool: string): void {
+  const kind = toolKind(tool)
+  const key = work.tools[kind] !== undefined || Object.keys(work.tools).length < WORK_TOOLS ? kind : 'other'
+  work.tools[key] = (work.tools[key] ?? 0) + 1
+}
+
+function countTurn(work: WorkReport, e: TurnCompleteInput): void {
+  if (e.agentId !== undefined) {
+    work.agentRuns += 1
+    return
+  }
+  work.turns.count += 1
+  if (e.isAborted) work.turns.aborted += 1
+  if (e.reason === 'error' || e.reason === 'refusal') work.turns.failed += 1
+  work.turns.ms += amount(e.durationMs)
+}
+
+function measureOf(e: SessionMeasureInput): WorkMeasure {
+  return {
+    contextPct: typeof e.context?.percent === 'number' && Number.isFinite(e.context.percent) ? e.context.percent : null,
+    contextWindow: amount(e.context?.window),
+    rateLimits: (e.rateLimits ?? []).slice(0, 4).map(limit => ({
+      kind: String(limit.kind).slice(0, 32),
+      percentUsed: amount(limit.percentUsed),
+      resetsAt: typeof limit.resetsAt === 'string' ? limit.resetsAt.slice(0, 40) : null,
+    })),
+    costUsd: typeof e.cost?.usd === 'number' && Number.isFinite(e.cost.usd) ? e.cost.usd : null,
+  }
+}
+
+// Counting never holds up Claude: a failure loses one count, kept in memory for the next beat.
+async function countSafely($: EngineInterface, rt: Runtime, change: (work: WorkReport) => void): Promise<void> {
+  try {
+    change(rt.work)
+    await $.state.set(WORK, rt.work)
+  } catch {
+    // the next count saves it
   }
 }
 
@@ -755,10 +993,10 @@ async function statusReport($: EngineInterface, rt: Runtime): Promise<string> {
       lines.push(`devices: ${devicesText(res, res.player)}`)
     }
     const where = res.machines > 1 ? `across ${res.machines} devices` : 'on this machine'
-    lines.push(`sessions: ${res.presence.sessionCount} live ${where} · shown as ${res.presence.model ?? 'unknown'}${res.presence.effort ? ` · ${res.presence.effort}` : ''}`)
+    lines.push(`sessions: ${res.presence.sessionCount} reporting ${where} (idle ones stay quiet) · shown as ${res.presence.model ?? 'unknown'}${res.presence.effort ? ` · ${res.presence.effort}` : ''}`)
     lines.push(`buff: ${buffText(res)}`)
   }
-  const doing = body.working ? ' · working' : rt.turn.waiting ? ' · waiting on you' : ''
+  const doing = body.working ? ' · working' : rt.turn.waiting ? ' · waiting on you' : isReporting(rt, now) ? '' : ' · idle'
   lines.push(`this session: model ${body.model ?? 'unknown'} · effort ${body.effort ?? 'not known until a turn runs'}${doing}`)
   const note = rt.identityNote === null ? '' : `; ${rt.identityNote}`
   lines.push(`identity: ${rt.identityPath ?? (await identityPath($))} (stays on this machine${note})`)
@@ -905,8 +1143,12 @@ export const register: Register = on => {
     identityNote: null,
     activity: { lastActiveAt: null, step: null },
     turn: { running: false, agents: [], waiting: false },
+    work: newWork(),
     lastSentWorking: null,
     lastBeatAt: null,
+    keepalivePath: null,
+    answerPath: null,
+    answeredAt: null,
     updateToastFor: null,
     link: 'unknown',
     linkError: null,
@@ -936,6 +1178,9 @@ export const register: Register = on => {
     // A reload mid-turn keeps the turn, its subagents and a prompt waiting on the person.
     const { value: turn } = await $.state.get(TURN)
     if (turn !== undefined) rt.turn = turn
+    // And goes on counting the same run.
+    const { value: work } = await $.state.get(WORK)
+    rt.work = restoreWork(work)
     const { value: autoOpenState } = await $.state.get(AUTO_OPEN)
     rt.isAutoOpenPending = autoOpenState === 'pending'
     await ensureIdentity($, rt) // first: it makes ~/.claudefishing owner-only
@@ -968,13 +1213,16 @@ export const register: Register = on => {
     } else {
       await touchSafely($, rt, rt.turn.agents.includes(e.agentId) ? {} : { agents: [...rt.turn.agents, e.agentId] })
     }
-    return yield* next(e)
+    const result = yield* next(e)
+    await countSafely($, rt, work => countStep(work, result))
+    return result
   })
 
   // next(e) holds the permission prompt and the tool itself; its end (PostToolUse, or a refusal) is Claude going on.
   on('tool.call', async ($, e, next) => {
     // This plugin's own questions (/fishing link) are neither Claude working nor Claude waiting.
     if (next.origin.plugin === $.plugin.name) return next(e)
+    await countSafely($, rt, work => countTool(work, e.tool))
     await touchSafely($, rt)
     if (ASKS_USER.has(e.tool)) await setWaitingSafely($, rt, true)
     try {
@@ -984,9 +1232,19 @@ export const register: Register = on => {
     }
   })
 
+  // Counted first: the beat the turn's end sends carries it.
   on('turn.complete', async ($, e, next) => {
     const agentId = e.agentId
+    await countSafely($, rt, work => countTurn(work, e))
     await touchSafely($, rt, agentId === undefined ? { running: false } : { agents: rt.turn.agents.filter(id => id !== agentId) })
+    return next(e)
+  })
+
+  // The status line's figures (context, plan limits, cost) as of the latest measure: not Claude doing anything.
+  on('session.measure', async ($, e, next) => {
+    await countSafely($, rt, work => {
+      work.measure = measureOf(e)
+    })
     return next(e)
   })
 
@@ -1057,10 +1315,13 @@ export const register: Register = on => {
     // A /clear (and an in-session /resume) keeps this process going as another conversation: block nothing.
     if (e.reason === 'clear' || e.reason === 'resume') {
       const result = await next(e)
+      const endedWork = rt.work
       rt.turn = { running: false, agents: [], waiting: false }
+      rt.work = newWork()
       rt.lastSentWorking = null
       await $.state.set(TURN, rt.turn).catch(() => undefined)
-      $.clock.after(0, () => void switchSessionSafely($, rt, e.sessionId))
+      await $.state.set(WORK, rt.work).catch(() => undefined)
+      $.clock.after(0, () => void switchSessionSafely($, rt, e.sessionId, endedWork))
       return result
     }
     rt.timer?.cancel()
