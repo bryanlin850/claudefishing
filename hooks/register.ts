@@ -56,6 +56,8 @@ const DEFAULT_SERVER_URL = 'https://claudefishing.io' // npm run dev:sync swaps 
 const KEEPALIVE_MS = 60_000
 /** Mirrors the server's presence.sessionTtlMs: no answer on the whole machine for this long, and a quiet session says offline. */
 const ANSWER_STALE_MS = 150_000
+/** A session taking over the machine's keepalive waits this long after its claim: of claims made together, the last one written beats. */
+const CLAIM_SETTLE_MS = 1_000
 /** How often the session checks, without the network, whether a keepalive is due or a turn went stale. */
 const TICK_MS = 5_000
 /** After this session opens the game, every tick beats until the server sees the window join, for at most this long. */
@@ -86,6 +88,22 @@ const USAGE = 'usage: /fishing [status|open|on|off|link [code]|unlink]'
 /** Models and tools a work report keeps apart: past these, a request counts in the totals only, a tool as "other". */
 const WORK_MODELS = 8
 const WORK_TOOLS = 40
+/**
+ * The only tools a work report names: Claude Code's own (this build's, from its tool types, and a
+ * few of older builds'). A plugin can register a tool of any name, and an MCP tool names its server,
+ * so either could say what someone works with: those count as "other" and "mcp".
+ */
+const BUILTIN_TOOLS: ReadonlySet<string> = new Set([
+  'Agent', 'AppifactRepl', 'Artifact', 'ArtifactCheck', 'ArtifactComments', 'ArtifactData', 'AskUserQuestion', 'Bash', 'BashOutput',
+  'CronCreate', 'CronDelete', 'CronList', 'DesignSync', 'Edit', 'EndConversation', 'EnterPlanMode', 'EnterWorktree', 'ExitPlanMode',
+  'ExitWorktree', 'FetchInboxMessage', 'GetTask', 'Glob', 'Grep', 'KillShell', 'LS', 'LSP', 'ListAgents', 'ListConnectors',
+  'ListMcpResourcesTool', 'ListPlugins', 'ListSkills', 'Monitor', 'MultiEdit', 'NotebookEdit', 'NotebookRead', 'Poll', 'Projects',
+  'ProposeGoal', 'PushNotification', 'Read', 'ReadMcpResourceDirTool', 'ReadMcpResourceTool', 'ReadNotifications', 'RemoteTrigger',
+  'ReportFindings', 'ScheduleWakeup', 'SearchMcpRegistry', 'SearchPlugins', 'SearchSkills', 'SendFeedback', 'SendFile', 'SendMessage',
+  'SendUserFile', 'SendUserMessage', 'ShareOnboardingGuide', 'ShowOnboardingRolePicker', 'Skill', 'SlashCommand', 'SuggestConnectors',
+  'SuggestPluginInstall', 'SuggestSkills', 'Task', 'TaskCreate', 'TaskGet', 'TaskList', 'TaskOutput', 'TaskStop', 'TaskUpdate',
+  'TodoWrite', 'ToolSearch', 'WaitForMcpServers', 'WebFetch', 'WebSearch', 'Workflow', 'Write',
+])
 
 // Session-scoped values that survive hot reloads (module variables do not).
 const ACTIVITY = { plugin: 'claudefishing', key: 'activity' } as const
@@ -540,9 +558,14 @@ function queueBeat($: EngineInterface, rt: Runtime): void {
 // ─── one keepalive per machine ─────────────────────────────────────────────
 // The game needs two things of a machine: that Claude Code is open on it, and which sessions
 // Claude worked in within the buff window. Every beat is stamped in keepalive.json before it goes,
-// and an idle session keeps the machine alive only when that stamp is a keepalive old; every answer
-// lands in answer.json, which the quiet sessions' status lines follow. Both are written in place:
-// a torn read costs one extra beat, or one tick of an older status line.
+// and an idle session keeps the machine alive only when that stamp is a keepalive old: the session
+// that kept it alive last goes on, any other claims it first (sessions finding it due together
+// would all beat otherwise). Every answer lands in answer.json unless a newer one is there, and the
+// quiet sessions' status lines follow it. Both are written in place: a torn read costs one extra
+// beat, or one tick of an older status line.
+
+/** `claim`: a session taking the keepalive over wrote it, and beats if it is still its claim CLAIM_SETTLE_MS later. */
+type KeepaliveStamp = { at: number; sessionId: string; claim?: string }
 
 type SharedAnswer = { at: number; modVersion: string; answer: HeartbeatResponse }
 
@@ -552,21 +575,31 @@ function isReporting(rt: Runtime, now: number): boolean {
   return isWorking(rt, now) || (last !== null && now - last < INACTIVE_MS)
 }
 
-/** When any session of the machine last beat; null with no stamp, or one that does not read. */
-async function readKeepalive($: EngineInterface, rt: Runtime): Promise<number | null> {
+/** When a session of the machine last beat (or claimed the keepalive), and which; null with no stamp, or one that does not read. */
+async function readKeepalive($: EngineInterface, rt: Runtime): Promise<KeepaliveStamp | null> {
   rt.keepalivePath ??= `${await homeDir($)}/keepalive.json`
   try {
     if (!(await $.fs.exists(rt.keepalivePath))) return null
-    const { at } = JSON.parse(await $.fs.read(rt.keepalivePath)) as { at?: unknown }
-    return typeof at === 'number' && Number.isFinite(at) ? at : null
+    const { at, sessionId, claim } = JSON.parse(await $.fs.read(rt.keepalivePath)) as Partial<Record<keyof KeepaliveStamp, unknown>>
+    if (typeof at !== 'number' || !Number.isFinite(at) || typeof sessionId !== 'string') return null
+    return { at, sessionId, ...(typeof claim === 'string' ? { claim } : {}) }
   } catch {
     return null
   }
 }
 
-async function stampKeepalive($: EngineInterface, rt: Runtime, sessionId: string, now: number): Promise<void> {
+async function stampKeepalive($: EngineInterface, rt: Runtime, sessionId: string, now: number, claim?: string): Promise<void> {
   rt.keepalivePath ??= `${await homeDir($)}/keepalive.json`
-  await $.fs.write(rt.keepalivePath, `${JSON.stringify({ at: now, sessionId })}\n`)
+  const stamp: KeepaliveStamp = { at: now, sessionId, ...(claim !== undefined ? { claim } : {}) }
+  await $.fs.write(rt.keepalivePath, `${JSON.stringify(stamp)}\n`)
+}
+
+/** Claims the machine's keepalive: true when no claim written meanwhile (or beat sent) replaced this one. */
+async function claimKeepalive($: EngineInterface, rt: Runtime, sessionId: string, now: number): Promise<boolean> {
+  const claim = hex(crypto.getRandomValues(new Uint8Array(6)))
+  await stampKeepalive($, rt, sessionId, now, claim)
+  await $.clock.sleep(CLAIM_SETTLE_MS)
+  return (await readKeepalive($, rt))?.claim === claim
 }
 
 /** The last answer any session of the machine got; null with none, or one that does not read. */
@@ -583,7 +616,10 @@ async function readAnswer($: EngineInterface, rt: Runtime): Promise<SharedAnswer
   }
 }
 
+/** Unless a newer answer is there already: two sessions' answers can land in either order. */
 async function shareAnswer($: EngineInterface, rt: Runtime, now: number, answer: HeartbeatResponse): Promise<void> {
+  const current = await readAnswer($, rt)
+  if (current !== null && current.answer.serverTime >= answer.serverTime) return
   rt.answerPath ??= `${await homeDir($)}/answer.json`
   await $.fs.write(rt.answerPath, `${JSON.stringify({ at: now, modVersion: MOD_VERSION, answer } satisfies SharedAnswer)}\n`)
 }
@@ -592,8 +628,10 @@ async function shareAnswer($: EngineInterface, rt: Runtime, now: number, answer:
 async function isKeepaliveDue($: EngineInterface, rt: Runtime, now: number): Promise<boolean> {
   if (rt.lastBeatAt !== null && now - rt.lastBeatAt < KEEPALIVE_MS) return false
   if (isReporting(rt, now)) return true
-  const machineAt = await readKeepalive($, rt)
-  return machineAt === null || now - machineAt >= KEEPALIVE_MS
+  const stamp = await readKeepalive($, rt)
+  if (stamp !== null && now - stamp.at < KEEPALIVE_MS) return false
+  const sessionId = await $.session.id()
+  return stamp?.sessionId === sessionId || claimKeepalive($, rt, sessionId, now)
 }
 
 // A quiet session shows the newest answer of the machine. With none for a session's lifetime on the
@@ -829,7 +867,7 @@ function addTokens(to: WorkTokens, usage: TurnUsage): void {
 /** A tool as the game hears of it: Claude Code's own by name, never which MCP server or plugin. */
 function toolKind(tool: string): string {
   if (tool.startsWith('mcp__')) return 'mcp'
-  return /^[A-Z][A-Za-z]{0,39}$/.test(tool) ? tool : 'other'
+  return BUILTIN_TOOLS.has(tool) ? tool : 'other'
 }
 
 /** A response's model and tokens; a request no response answered counts for nothing. */

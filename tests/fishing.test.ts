@@ -724,11 +724,38 @@ describe('one keepalive per machine', () => {
       await w.clock.advance(30_000)
     }
     expect(w.beats()).toHaveLength(1)
-    // The other goes quiet too: the first tick a minute after its last beat keeps the machine alive.
+    // The other goes quiet too: the first tick a minute after its last beat claims the keepalive, and beats once the claim held.
     const last = w.clock.now() - 30_000
     await w.clock.advance(35_000)
-    expect(w.beats().map(b => b.at)).toEqual([1_000_000, last + 60_000])
-    expect(JSON.parse(w.files.get(KEEPALIVE_FILE)!)).toEqual({ at: last + 60_000, sessionId: 'sess-1' })
+    expect(w.beats().map(b => b.at)).toEqual([1_000_000, last + 61_000])
+    expect(JSON.parse(w.files.get(KEEPALIVE_FILE)!)).toEqual({ at: last + 61_000, sessionId: 'sess-1' })
+  })
+
+  test('of sessions taking the keepalive over together, only the one whose claim was written last beats', async ($, on) => {
+    const w = world(on)
+    await $.session.start(START)
+    await w.clock.settle()
+    // Another session kept the machine alive last, a minute ago.
+    w.files.set(KEEPALIVE_FILE, `${JSON.stringify({ at: 1_000_000, sessionId: 'other' })}\n`)
+    await w.clock.set(1_060_500) // the tick at 1_060_000 found it due and claimed it
+    expect(JSON.parse(w.files.get(KEEPALIVE_FILE)!)).toEqual({ at: 1_060_000, sessionId: 'sess-1', claim: expect.stringMatching(/^[0-9a-f]{12}$/) })
+    // A third session's claim lands after this one's: it beats, this one does not.
+    w.files.set(KEEPALIVE_FILE, `${JSON.stringify({ at: 1_060_400, sessionId: 'third', claim: 'abc' })}\n`)
+    await w.clock.set(1_100_000)
+    expect(w.beats()).toHaveLength(1)
+    // Its claim never came to a beat (it quit): a keepalive after the claim, this session takes over.
+    await w.clock.set(1_130_000)
+    expect(w.beats().map(b => b.at)).toEqual([1_000_000, 1_126_000])
+  })
+
+  test('an answer older than the one in answer.json never replaces it', async ($, on) => {
+    const w = world(on)
+    const newer = { at: 999_000, modVersion: MOD_VERSION, answer: { ...heartbeatResponse(w.server), serverTime: 6_000_000, clientConnected: true } }
+    w.files.set(ANSWER_FILE, `${JSON.stringify(newer)}\n`)
+    await $.session.start(START)
+    await w.clock.settle()
+    expect(w.beats()).toHaveLength(1)
+    expect(JSON.parse(w.files.get(ANSWER_FILE)!)).toEqual(newer)
   })
 
   test('a session Claude worked in keeps itself alive through the buff window, then leaves it to the machine', async ($, on) => {
@@ -808,9 +835,10 @@ describe('what Claude did', () => {
     for await (const chunk of $.turn.step({ turnId: 't1', index: 0, model: 'claude-opus-5-5', effort: 'high', messageCount: 1 })) void chunk
     await $.tool.call({ tool: 'Bash', command: 'ls' } as never)
     await $.tool.call({ tool: 'Bash', command: 'pwd' } as never)
-    // Neither the MCP server nor a plugin's tool is named.
+    // Neither the MCP server nor a plugin's tool is named, however Claude Code-like its name.
     await $.tool.call({ tool: 'mcp__slack__post_message', text: 'hi' } as never)
     await $.tool.call({ tool: 'some_plugin_tool' } as never)
+    await $.tool.call({ tool: 'Weather' } as never)
     w.stepUsage.next = { model: 'claude-haiku-4-5', input_tokens: 1, output_tokens: 20, cache_read_input_tokens: 0, cache_creation_input_tokens: 0 }
     for await (const chunk of $.turn.step({ turnId: 's1', index: 0, model: 'claude-haiku-4-5', messageCount: 1, agentId: 'a1' })) void chunk
     await $.turn.complete({ ...DONE, turnId: 's1', agentId: 'a1' })
@@ -827,7 +855,7 @@ describe('what Claude did', () => {
       },
       turns: { count: 1, aborted: 0, failed: 0, ms: 4_000 },
       agentRuns: 1,
-      tools: { Bash: 2, mcp: 1, other: 1 },
+      tools: { Bash: 2, mcp: 1, other: 2 },
     })
   })
 
