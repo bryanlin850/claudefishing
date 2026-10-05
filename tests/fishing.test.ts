@@ -36,6 +36,8 @@ type WorldOptions = {
   chromeMissing?: boolean
   /** Each $.fs.write takes this long on the clock. */
   writeMs?: number
+  /** Environment variables besides HOME. */
+  env?: Record<string, string>
 }
 
 const IDENTITY = '/home/cat/.claudefishing/identity.json'
@@ -112,7 +114,7 @@ function world(on: On, opts: WorldOptions = {}) {
     return { value: undefined } as never
   })
   on('store.keys', () => ({ value: [...store.keys()] }) as never)
-  mock.env(on, { HOME: '/home/cat' })
+  mock.env(on, { HOME: '/home/cat', ...opts.env })
   on('state.get', ($, e) => ({ value: { value: state.get((e as { key: string }).key), version: 0 } }) as never)
   on('state.set', ($, e) => {
     const { key, value } = e as { key: string; value: unknown }
@@ -317,11 +319,20 @@ describe('heartbeats', () => {
     })
   })
 
-  test('serverUrl comes from userConfig (trailing slash dropped)', { options: { serverUrl: 'http://127.0.0.1:8792/' } }, async ($, on) => {
-    const w = world(on)
+  test('CLAUDEFISHING_SERVER_URL names a server on this machine (development)', async ($, on) => {
+    const w = world(on, { env: { CLAUDEFISHING_SERVER_URL: ' http://127.0.0.1:8792/ ' } })
     await $.session.start(START)
     await w.clock.settle()
     expect(w.beats()[0]?.url).toBe('http://127.0.0.1:8792/api/heartbeat')
+  })
+
+  test('a server anywhere else is ignored: the secret only goes to the game', async ($, on) => {
+    const w = world(on, { env: { CLAUDEFISHING_SERVER_URL: 'https://localhost.example.com:8792' } })
+    await $.session.start(START)
+    await w.clock.settle()
+    expect(w.beats()[0]?.url).toBe('https://claudefishing.io/api/heartbeat')
+    const { text } = await $.command.run({ command: 'fishing', args: 'status', ...TYPED })
+    expect(text).toMatch(/^fishing on · server https:\/\/claudefishing\.io · /)
   })
 
   test('a turn: working at once, model/effort from the main-loop step, activeAgoMs from the last activity', async ($, on) => {
@@ -1157,8 +1168,8 @@ describe('auto-open', () => {
     expect(w.pairs()).toHaveLength(1)
   })
 
-  test('nothing opens when the server skips it, or autoOpen is off', { options: { autoOpen: false } }, async ($, on) => {
-    const w = world(on)
+  test('nothing opens with CLAUDEFISHING_AUTO_OPEN off', async ($, on) => {
+    const w = world(on, { env: { CLAUDEFISHING_AUTO_OPEN: 'off' } })
     await $.session.start({ cwd: '/proj', surface: 'terminal', isInteractive: true })
     await $.session.attach({ surface: 'desktop', clientId: 'desktop:default' })
     await w.clock.settle()

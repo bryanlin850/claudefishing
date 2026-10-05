@@ -1,5 +1,5 @@
 {
-  "version": "0.3.0",
+  "version": "0.3.1",
   "updateCommand": "claude plugin marketplace update claudefishing && claude plugin update claudefishing@claudefishing",
   "contract": {
     "path": "types/protocol.ts",

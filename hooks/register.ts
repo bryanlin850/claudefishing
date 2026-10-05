@@ -29,6 +29,11 @@ import type {
 } from '../types/protocol'
 
 const DEFAULT_SERVER_URL = 'https://claudefishing.io' // npm run dev:sync swaps in the dev server in its copy only
+// No plugin.json userConfig: Claude Code reports declared options as "not yet set" on install, defaults or
+// not. CLAUDEFISHING_AUTO_OPEN=0 (false, no, off), from the shell or the `env` block of settings.json,
+// keeps the game from opening by itself. CLAUDEFISHING_SERVER_URL is for development and names a server
+// on this machine only: every request carries the machine's secret, and a project's settings can set
+// environment variables, so nothing in them may send it anywhere but the game.
 
 /** Every change is sent at once (queueBeat); with none, the server still hears from the session this often. */
 const KEEPALIVE_MS = 60_000
@@ -73,7 +78,9 @@ type Link = 'unknown' | 'online' | 'offline'
 type Reply = { ok: true; json: unknown } | { ok: false; error: string; status?: number; code?: string }
 
 type Runtime = {
+  /** DEFAULT_SERVER_URL, or a server on this machine from CLAUDEFISHING_SERVER_URL; no trailing slash. */
   serverUrl: string
+  /** Open the game once per session (CLAUDEFISHING_AUTO_OPEN turns it off). */
   autoOpen: boolean
   /** This session acts on: reports while on; turned off it went quiet. Follows `fishing.on` within a tick. */
   enabled: boolean
@@ -141,6 +148,23 @@ function markEnded(rt: Runtime, sessionId: string, now: number): void {
   // An end older than a minute matters to nobody: the guard and the server's tombstone are seconds long.
   for (const [id, at] of rt.endedAt) if (now - at > 60_000) rt.endedAt.delete(id)
   rt.endedAt.set(sessionId, now)
+}
+
+/** CLAUDEFISHING_SERVER_URL when it names a server on this machine (development), else DEFAULT_SERVER_URL. */
+function serverUrlFrom(value: string | null | undefined): string {
+  const fallback = DEFAULT_SERVER_URL.replace(/\/+$/, '')
+  if (!value?.trim()) return fallback
+  try {
+    const url = new URL(value.trim())
+    const isThisMachine = ['localhost', '127.0.0.1', '[::1]'].includes(url.hostname)
+    return isThisMachine && (url.protocol === 'http:' || url.protocol === 'https:') ? url.origin : fallback
+  } catch {
+    return fallback
+  }
+}
+
+function autoOpenFrom(value: string | null | undefined): boolean {
+  return !/^(0|false|no|off)$/i.test(value?.trim() ?? '')
 }
 
 function pct(fraction: number): string {
@@ -866,10 +890,10 @@ async function unlinkMachine($: EngineInterface, rt: Runtime): Promise<string> {
 
 // ─── hooks ─────────────────────────────────────────────────────────────────
 
-export const register: Register = (on, options) => {
+export const register: Register = on => {
   const rt: Runtime = {
-    serverUrl: (typeof options.serverUrl === 'string' && options.serverUrl.trim() !== '' ? options.serverUrl.trim() : DEFAULT_SERVER_URL).replace(/\/+$/, ''),
-    autoOpen: options.autoOpen !== false,
+    serverUrl: DEFAULT_SERVER_URL, // session.start reads the environment
+    autoOpen: true,
     enabled: true,
     fishing: FIRST_SWITCH,
     fishingPath: null,
@@ -905,6 +929,8 @@ export const register: Register = (on, options) => {
       description: 'claudefishing: status | open | on | off | link | unlink',
       argumentHint: '[status|open|on|off|link [code]|unlink]',
     })
+    rt.serverUrl = serverUrlFrom(await $.env.get('CLAUDEFISHING_SERVER_URL'))
+    rt.autoOpen = autoOpenFrom(await $.env.get('CLAUDEFISHING_AUTO_OPEN'))
     const { value: activity } = await $.state.get(ACTIVITY)
     if (activity !== undefined) rt.activity = activity
     // A reload mid-turn keeps the turn, its subagents and a prompt waiting on the person.
