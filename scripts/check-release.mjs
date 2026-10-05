@@ -10,6 +10,8 @@ const release = JSON.parse(read('release.json'))
 const runtimeVersion = /export const MOD_VERSION = '([^']+)'/.exec(read('types/version.ts'))?.[1]
 assert.match(manifest.version, /^\d+\.\d+\.\d+$/)
 assert.equal(manifest.name, 'claudefishing')
+// Declared options print "N userConfig options not yet set" on every install, defaults or not: settings are environment variables.
+assert.equal(manifest.userConfig, undefined, 'plugin.json declares no userConfig')
 assert.equal(marketplace.name, 'claudefishing')
 assert.deepEqual(marketplace.plugins, [{ name: 'claudefishing', source: './' }])
 assert.equal(runtimeVersion, manifest.version)

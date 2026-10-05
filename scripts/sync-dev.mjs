@@ -26,10 +26,6 @@ try {
     cpSync(join(root, path), output, { recursive: true })
   }
   const url = serverUrl.href.replace(/\/+$/, '')
-  const manifestPath = join(stage, '.claude-plugin/plugin.json')
-  const manifest = JSON.parse(readFileSync(manifestPath, 'utf8'))
-  manifest.userConfig.serverUrl.default = url
-  writeFileSync(manifestPath, JSON.stringify(manifest, null, 2) + '\n')
   const hooksPath = join(stage, 'hooks/register.ts')
   const hooks = readFileSync(hooksPath, 'utf8')
   const declaration = "const DEFAULT_SERVER_URL = 'https://claudefishing.io'"

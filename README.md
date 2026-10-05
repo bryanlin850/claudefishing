@@ -12,7 +12,8 @@ sessions to the game:
   spends waiting on you (a permission prompt, a question, plan approval, an
   MCP form) does not count as working;
 * `/fishing open` opens the game in a chromeless Chrome window, and the game
-  opens on its own once per session when one starts (setting `autoOpen`).
+  opens on its own once per session when one starts (unless
+  `CLAUDEFISHING_AUTO_OPEN=0`).
 
 This is a Claude Code mod: `hooks/register.ts` runs inside Claude Code.
 The game and server are hosted separately; installing the mod requires no game
@@ -21,7 +22,35 @@ use 2.1.289. The mod adds no skills, MCP server, or model calls.
 
 ## Install
 
-Pick one.
+Pick one, then type **`/reload-plugins`** in any Claude Code session that is
+already open (a new session loads the plugin by itself).
+
+**Terminal** (recommended):
+
+```sh
+claude plugin marketplace add bryanlin850/claudefishing
+claude plugin install claudefishing@claudefishing
+```
+
+or, inside a terminal session of Claude Code, `/plugin marketplace add
+bryanlin850/claudefishing`, then `/plugin install claudefishing@claudefishing`.
+
+**Claude desktop app**: typing `/plugin marketplace add …` in the Code tab
+drops its arguments, so either
+
+1. send Claude this message; it runs the two commands above with the app's own
+   copy of `claude`, which is often not on your `PATH`:
+
+   ```
+   Install the claudefishing plugin for me by running this in the shell:
+   c="${CLAUDE_CODE_EXECPATH:-claude}"; "$c" plugin marketplace add bryanlin850/claudefishing && "$c" plugin install claudefishing@claudefishing
+   When it finishes, tell me to type /reload-plugins.
+   ```
+
+2. or open **Settings**, scroll to **Plugins**, click **Add**, choose **Add
+   from a repository** and paste `https://github.com/bryanlin850/claudefishing`.
+
+Then type **`/reload-plugins`** in the Code tab.
 
 **One session, from a checkout**
 
@@ -29,38 +58,28 @@ Pick one.
 claude --plugin-dir /path/to/claudefishing
 ```
 
-**Every session, including the desktop app**: name the folder in
-`CLAUDE_CODE_PLUGIN_DIRS`, in your shell or in the `env` block of
+**Every session from a checkout, including the desktop app**: name the folder
+in `CLAUDE_CODE_PLUGIN_DIRS`, in your shell or in the `env` block of
 `~/.claude/settings.json` (the desktop app reads the latter):
 
 ```json
 { "env": { "CLAUDE_CODE_PLUGIN_DIRS": "/path/to/claudefishing" } }
 ```
 
-**From the marketplace** (recommended):
-
-```sh
-claude plugin marketplace add bryanlin850/claudefishing
-claude plugin install claudefishing@claudefishing
-```
-
-or inside Claude Code: `/plugin marketplace add …`, then `/plugin install
-claudefishing@claudefishing`.
-
 ### Settings
 
-| Option | Default | |
-| --- | --- | --- |
-| `serverUrl` | `https://claudefishing.io` | The game server. The copy `npm run dev:sync -- /path/to/dev-mods/<session>` makes uses `http://localhost:8790` instead. |
-| `autoOpen` | `true` | Open the game once per session when an interactive terminal session starts, or the desktop app or VS Code attaches (a phone never opens it). The server skips it while a game window is already connected or one was opened in the last minute. If the server could not be reached, it is tried again on the first heartbeat it answers. |
-
-Set them with `/plugin configure claudefishing@claudefishing` (marketplace
-install), or `echo '{"serverUrl":"https://…"}' | claude plugin configure
-claudefishing@claudefishing --values-stdin`. For a `--plugin-dir` or
-`CLAUDE_CODE_PLUGIN_DIRS` install, put them in settings:
+There is nothing to configure: the plugin declares no options (Claude Code
+would list them as "not yet set" on every install), and it only ever talks
+to https://claudefishing.io. The game opens by itself once per session when
+an interactive terminal session starts, or the desktop app or VS Code
+attaches (a phone never opens it; the server skips it while a game window is
+already connected, one was opened in the last minute, or fishing is off). To
+keep it from doing that, set `CLAUDEFISHING_AUTO_OPEN` to `0` (or `false`,
+`no`, `off`) in your shell or in the `env` block of `~/.claude/settings.json`
+(the desktop app reads the latter):
 
 ```json
-{ "pluginConfigs": { "claudefishing": { "options": { "serverUrl": "https://…" } } } }
+{ "env": { "CLAUDEFISHING_AUTO_OPEN": "0" } }
 ```
 
 Mods are enabled by default in supported Claude Code versions. Update Claude
@@ -76,7 +95,9 @@ auto-update). By hand:
 claude plugin marketplace update claudefishing && claude plugin update claudefishing@claudefishing
 ```
 
-then run `/reload-plugins` or restart Claude Code. When a newer plugin is out, the status line says
+then type `/reload-plugins` (or restart Claude Code). In the desktop app, ask
+Claude to run it: its shell has the app's own `claude` as
+`$CLAUDE_CODE_EXECPATH`. When a newer plugin is out, the status line says
 `· update available`, a toast gives that command once, and `/fishing` shows
 it; when the server needs a newer one than yours, the status line says
 `🎣 update the plugin to play` and the game shows an update screen.
@@ -152,7 +173,8 @@ carries a one-time pairing code; it works once, for two minutes.
 
 ## What it sends, and what stays local
 
-Every request goes to `serverUrl` with `Authorization: Bearer <secret>`.
+Every request goes to `https://claudefishing.io` (in development, to a server
+on the same machine) with `Authorization: Bearer <secret>`.
 
 * **Identity.** On first use the plugin creates `~/.claudefishing/identity.json`
   (`{ secret, createdAt }`, a random 256-bit secret; the folder is mode 700,
@@ -213,15 +235,18 @@ Code binary. It uses a temporary identity/configuration and a closed loopback
 port; it neither opens the game nor needs an account. Generated declarations
 are ignored by Git. Run `npm run types:generate` to refresh them separately.
 
-For a local game server, load this checkout with explicit configuration:
+For a local game server, load this checkout with the server in the
+environment:
 
 ```sh
-claude --plugin-dir /path/to/claudefishing \
-  --settings '{"pluginConfigs":{"claudefishing":{"options":{"serverUrl":"http://localhost:8790","autoOpen":false}}}}'
+CLAUDEFISHING_SERVER_URL=http://localhost:8790 CLAUDEFISHING_AUTO_OPEN=0 claude --plugin-dir /path/to/claudefishing
 ```
 
-Use `CLAUDEFISHING_HOME` to choose a separate test identity (and on/off
-switch). To copy the mod
+`CLAUDEFISHING_SERVER_URL` only takes a server on the same machine
+(`localhost`, `127.0.0.1` or `[::1]`); anything else is ignored. Every request
+carries the machine's secret, and a project's `.claude/settings.json` can set
+environment variables, so no setting may send it to another server. Use
+`CLAUDEFISHING_HOME` to choose a separate test identity (and on/off switch). To copy the mod
 into an existing hot-reload session, name that session explicitly:
 
 ```sh
