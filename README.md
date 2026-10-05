@@ -49,6 +49,8 @@ drops its arguments, so either
 
 2. or open **Settings**, scroll to **Plugins**, click **Add**, choose **Add
    from a repository** and paste `https://github.com/bryanlin850/claudefishing`.
+   That adds the marketplace only: find **claudefishing** in the list and
+   click **Install**.
 
 Then type **`/reload-plugins`** in the Code tab.
 
