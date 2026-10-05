@@ -1,0 +1,20 @@
+{
+  "name": "claudefishing",
+  "version": "0.2.1",
+  "private": true,
+  "type": "module",
+  "engines": {
+    "node": ">=22.18.0"
+  },
+  "scripts": {
+    "validate": "claude plugin validate --strict .claude-plugin/plugin.json && claude plugin validate --strict .claude-plugin/marketplace.json && node scripts/check-release.mjs",
+    "test": "claude plugin test .",
+    "types:generate": "node scripts/generate-types.mjs",
+    "typecheck": "npm run types:generate && tsc --noEmit -p .",
+    "dev:sync": "node scripts/sync-dev.mjs"
+  },
+  "devDependencies": {
+    "@anthropic-ai/claude-code": "2.1.289",
+    "typescript": "7.0.2"
+  }
+}

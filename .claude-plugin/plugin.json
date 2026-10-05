@@ -1,0 +1,31 @@
+{
+  "name": "claudefishing",
+  "version": "0.2.1",
+  "description": "claudefishing: a shared fishing lobby you play while Claude Code is open; your cat gets a slight buff while Claude is working.",
+  "author": {
+    "name": "bryan"
+  },
+  "types": "./types/index.d.ts",
+  "userConfig": {
+    "serverUrl": {
+      "type": "string",
+      "title": "Server URL",
+      "description": "Base URL of the claudefishing server",
+      "default": "https://claudefishing.io"
+    },
+    "autoOpen": {
+      "type": "boolean",
+      "title": "Open the game automatically",
+      "description": "Open the game window once per session when an interactive terminal session starts or the desktop app or VS Code attaches, unless one is already open",
+      "default": true
+    }
+  },
+  "homepage": "https://claudefishing.io",
+  "repository": "https://github.com/bryanlin850/claudefishing",
+  "keywords": [
+    "fishing",
+    "game",
+    "claude-code",
+    "mod"
+  ]
+}

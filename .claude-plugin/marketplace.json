@@ -1,0 +1,15 @@
+{
+  "name": "claudefishing",
+  "owner": {
+    "name": "bryan"
+  },
+  "metadata": {
+    "description": "The Claude Code mod for claudefishing."
+  },
+  "plugins": [
+    {
+      "name": "claudefishing",
+      "source": "./"
+    }
+  ]
+}
