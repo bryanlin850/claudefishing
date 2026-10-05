@@ -232,8 +232,11 @@ on the same machine) with `Authorization: Bearer <secret>`.
 
 * **The machine's keepalive and last answer**, beside the identity and never
   sent anywhere: `~/.claudefishing/keepalive.json` (`{ at, sessionId }`,
-  stamped before every heartbeat) and `~/.claudefishing/answer.json` (the last
-  heartbeat answer, which quiet sessions show).
+  stamped before every heartbeat; a session taking the keepalive over from
+  another writes a `claim` first and beats only if its claim is still there a
+  second later, so idle sessions finding it due together send one heartbeat)
+  and `~/.claudefishing/answer.json` (the newest heartbeat answer, which quiet
+  sessions show).
 * **`POST /api/pair`** `{ sessionId, reason: 'auto' | 'manual' }` when the game
   is opened. The server skips `auto` while fishing is off on the machine;
   `manual` (`/fishing open`) turns it on.
