@@ -556,6 +556,59 @@ describe('status line', () => {
     expect(w.statuses.at(-1)).toBe('🎣 game closed · ⚡+11%')
   })
 
+  test('after /fishing open: "opening game" and a beat every tick until the server sees the window', async ($, on) => {
+    const w = world(on)
+    await $.session.start(START)
+    await w.clock.settle()
+    const { text } = await $.command.run({ command: 'fishing', args: 'open', ...TYPED })
+    expect(text).toBe('opened in a Chrome app window')
+    expect(w.statuses.at(-1)).toBe('🎣 opening game')
+    const status = await $.command.run({ command: 'fishing', args: 'status', ...TYPED })
+    expect(status.text).toContain('\ngame: opening\n')
+
+    const count = w.beats().length
+    await w.clock.advance(5_000) // still loading
+    expect(w.beats()).toHaveLength(count + 1)
+    expect(w.statuses.at(-1)).toBe('🎣 opening game')
+
+    w.server.clientConnected = true // it joined
+    await w.clock.advance(5_000)
+    expect(w.beats()).toHaveLength(count + 2)
+    expect(w.statuses.at(-1)).toBe('🎣 in game')
+    await w.clock.advance(55_000) // then only the keepalive, a minute after the last beat
+    expect(w.beats()).toHaveLength(count + 2)
+    await w.clock.advance(5_000)
+    expect(w.beats()).toHaveLength(count + 3)
+  })
+
+  test('a window that never joins: "game closed" again after 45 s, then keepalives only', async ($, on) => {
+    const w = world(on)
+    await $.session.start(START)
+    await w.clock.settle()
+    await $.command.run({ command: 'fishing', args: 'open', ...TYPED })
+    await w.clock.advance(40_000)
+    expect(w.beats()).toHaveLength(9) // the first, then one every 5 s
+    expect(w.statuses.at(-1)).toBe('🎣 opening game')
+    await w.clock.advance(5_000)
+    expect(w.statuses.at(-1)).toBe('🎣 game closed')
+    await w.clock.advance(50_000)
+    expect(w.beats()).toHaveLength(9)
+    await w.clock.advance(5_000) // a minute after the last beat
+    expect(w.beats()).toHaveLength(10)
+  })
+
+  test('/fishing off while a window is awaited stops the beats at once', async ($, on) => {
+    const w = world(on)
+    await $.session.start(START)
+    await w.clock.settle()
+    await $.command.run({ command: 'fishing', args: 'open', ...TYPED })
+    await $.command.run({ command: 'fishing', args: 'off', ...TYPED })
+    const count = w.sent.length
+    await w.clock.advance(45_000)
+    expect(w.sent).toHaveLength(count)
+    expect(w.statuses.at(-1)).toBe('🎣 off')
+  })
+
   test('server down: offline, nothing throws, and it recovers', async ($, on) => {
     const w = world(on)
     w.server.down = true
@@ -672,9 +725,11 @@ describe('/fishing', () => {
     expect(text).toBe('fishing on · opened in a Chrome app window')
     expect(w.sent.map(s => s.url.replace('https://claudefishing.io', ''))).toEqual(['/api/heartbeat', '/api/pair'])
     expect(w.lastBeat()).toEqual(expect.objectContaining({ sessionId: 'sess-1', enabled: true }))
-    expect(w.statuses.at(-1)).toBe('🎣 game closed')
+    expect(w.statuses.at(-1)).toBe('🎣 opening game')
+    w.server.clientConnected = true
     await w.clock.advance(60_000)
-    expect(w.beats()).toHaveLength(2) // stored: the keepalive reads it
+    expect(w.beats()).toHaveLength(2) // stored: the next tick's beat reads it, and hears the window joined
+    expect(w.statuses.at(-1)).toBe('🎣 in game')
   })
 
   test('open falls back to the default browser without Chrome', async ($, on) => {
@@ -879,6 +934,7 @@ describe('auto-open', () => {
     expect(w.pairs()).toEqual([expect.objectContaining({ body: { sessionId: 'sess-1', reason: 'auto' } })])
     expect(w.argvs.filter(a => a[0] === 'open')).toEqual([['open', '-na', 'Google Chrome', '--args', '--app=https://claudefishing.io/#pair=K7Q2ZP']])
     expect(w.toasts).toEqual(['🎣 game opened in a Chrome app window'])
+    expect(w.statuses.at(-1)).toBe('🎣 opening game')
   })
 
   test('VS Code attaching auto-opens too; a phone does not', async ($, on) => {

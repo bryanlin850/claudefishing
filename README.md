@@ -125,6 +125,7 @@ The status line shows one of:
 | | |
 | --- | --- |
 | `🎣 in game` | the server answers and a game window is connected |
+| `🎣 opening game` | this session just opened the game and its window has not joined yet (at most 45 s) |
 | `🎣 game closed` | the server answers, no game window (`/fishing open`) |
 | `🎣 offline` | the server did not answer (the game stays locked unless another session reaches it) |
 | `🎣 off` | `/fishing off` |
@@ -151,9 +152,10 @@ Every request goes to `serverUrl` with `Authorization: Bearer <secret>`.
   instead (a second identity for testing).
 * **`POST /api/heartbeat`** per session, at once when something changes
   (Claude starts or stops working or starts waiting on you, the model or
-  effort changes, activity after 5 idle minutes), else as a keepalive once
-  nothing was sent for 60 s, and once when the session ends or you turn
-  fishing off:
+  effort changes, activity after 5 idle minutes), every 5 s for up to 45 s
+  after the session opens the game (until the answer says its window joined),
+  else as a keepalive once nothing was sent for 60 s, and once when the
+  session ends or you turn fishing off:
 
   | Field | |
   | --- | --- |

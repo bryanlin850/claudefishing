@@ -27,6 +27,8 @@ const DEFAULT_SERVER_URL = 'https://claudefishing.io' // npm run dev:sync swaps 
 const KEEPALIVE_MS = 60_000
 /** How often the session checks, without the network, whether a keepalive is due or a turn went stale. */
 const TICK_MS = 5_000
+/** After this session opens the game, every tick beats until the server sees the window join, for at most this long. */
+const OPENING_MS = 45_000
 const HTTP_TIMEOUT_MS = 4_000
 /** /fishing off waits this long for a beat in flight, so its enabled:false lands after it. */
 const OFF_INFLIGHT_WAIT_MS = 300
@@ -92,6 +94,8 @@ type Runtime = {
   isAutoOpening: boolean
   /** The auto-open could not reach the server: the next beat it answers tries again. */
   isAutoOpenPending: boolean
+  /** Until when a window this session opened is awaited (null: none): the line says "opening game" meanwhile. */
+  openingUntil: number | null
   /** Session ids this process told the server were over, and when. */
   endedAt: Map<string, number>
 }
@@ -134,7 +138,7 @@ function statusLine(rt: Runtime): string | undefined {
   if (rt.link === 'unknown') return undefined
   if (rt.link === 'offline' || rt.last === null) return '🎣 offline'
   if (rt.last.modUpdate?.required === true) return '🎣 update the plugin to play (/fishing status)'
-  const base = rt.last.clientConnected ? '🎣 in game' : '🎣 game closed'
+  const base = rt.last.clientConnected ? '🎣 in game' : rt.openingUntil !== null ? '🎣 opening game' : '🎣 game closed'
   const { buff } = rt.last.presence
   const update = rt.last.modUpdate ? ' · update available' : ''
   return buff.active ? `${base} · ⚡${pct(buff.pct)}${update}` : `${base}${update}`
@@ -275,6 +279,7 @@ function applyReply(rt: Runtime, reply: Reply): void {
   rt.link = res !== null ? 'online' : 'offline'
   rt.linkError = res !== null ? null : reply.ok ? 'unexpected answer' : reply.error
   rt.last = res ?? rt.last
+  if (res?.clientConnected === true) rt.openingUntil = null // the awaited window joined
 }
 
 async function beat($: EngineInterface, rt: Runtime): Promise<void> {
@@ -341,12 +346,17 @@ function queueBeat($: EngineInterface, rt: Runtime): void {
   })
 }
 
-// A keepalive once the server has heard nothing for KEEPALIVE_MS, or a beat as soon as a turn goes
-// stale (STALE_TURN_MS) and stops counting as work: time alone changes nothing else.
+// A keepalive once the server has heard nothing for KEEPALIVE_MS, a beat as soon as a turn goes
+// stale (STALE_TURN_MS) and stops counting as work, and one every tick while a window this session
+// opened has not joined (the server only says so in a beat's answer): time alone changes nothing else.
 async function tick($: EngineInterface, rt: Runtime): Promise<void> {
   const now = await $.clock.now()
+  if (rt.openingUntil !== null && now >= rt.openingUntil) {
+    rt.openingUntil = null // it never joined: "game closed" again, and keepalives only
+    $.ui.status(statusLine(rt))
+  }
   const isStale = rt.lastSentWorking === true && !isWorking(rt, now)
-  if (!isStale && rt.lastBeatAt !== null && now - rt.lastBeatAt < KEEPALIVE_MS) return
+  if (rt.openingUntil === null && !isStale && rt.lastBeatAt !== null && now - rt.lastBeatAt < KEEPALIVE_MS) return
   // Counted as a beat even if it cannot be sent (offline, fishing off): the next try is a keepalive later.
   rt.lastBeatAt = now
   await runBeat($, rt)
@@ -370,6 +380,7 @@ async function turnOn($: EngineInterface, rt: Runtime): Promise<void> {
 async function turnOff($: EngineInterface, rt: Runtime): Promise<void> {
   rt.enabled = false
   rt.lastSentWorking = null
+  rt.openingUntil = null
   if (rt.inFlight !== null) await Promise.race([rt.inFlight, $.clock.sleep(OFF_INFLIGHT_WAIT_MS)]) // land it first
   const identity = rt.identity
   const sessionId = await $.session.id()
@@ -510,6 +521,9 @@ async function openGame($: EngineInterface, rt: Runtime, reason: PairRequest['re
   const url = `${rt.serverUrl}/#pair=${encodeURIComponent(pair.code)}`
   const how = await openUrl($, url)
   if (how === null) return { kind: 'failed', text: `could not start a browser; open ${url} yourself (the link works once, for 2 minutes)` }
+  // The window takes a few seconds to load and join: until a beat's answer says it did, the line says so.
+  rt.openingUntil = (await $.clock.now()) + OPENING_MS
+  $.ui.status(statusLine(rt))
   return { kind: 'opened', text: `opened in ${how}` }
 }
 
@@ -571,7 +585,7 @@ async function statusReport($: EngineInterface, rt: Runtime): Promise<string> {
       const why = update.required ? `the game needs ${update.min ?? update.latest} or newer` : `${update.latest} is out`
       lines.push(`plugin: ${MOD_VERSION}, ${why}. Update in a terminal, then restart Claude Code: ${update.command}`)
     }
-    lines.push(`game: ${res.clientConnected ? 'in game' : 'closed (/fishing open)'}`)
+    lines.push(`game: ${res.clientConnected ? 'in game' : rt.openingUntil !== null ? 'opening' : 'closed (/fishing open)'}`)
     if (res.player !== null) {
       lines.push(`player: ${res.player.name} · level ${res.player.level} ${res.player.rank} · $${res.player.money}`)
       lines.push(`devices: ${devicesText(res, res.player)}`)
@@ -737,6 +751,7 @@ export const register: Register = (on, options) => {
     appliedSeq: 0,
     isAutoOpening: false,
     isAutoOpenPending: false,
+    openingUntil: null,
     endedAt: new Map(),
   }
 
