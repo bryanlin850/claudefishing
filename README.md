@@ -86,7 +86,7 @@ it; when the server needs a newer one than yours, the status line says
 ```
 /fishing              status (same as /fishing status)
 /fishing open         open the game window (pairs this machine with it; turns fishing on if it was off)
-/fishing off          stop reporting from every session on this machine
+/fishing off          stop reporting from every session on this machine, and close its game window
 /fishing on           resume
 /fishing link         a one-time code for another device to play this cat
 /fishing link <code>  play the cat that code was made for, here too
@@ -116,9 +116,23 @@ again asking first if it is the last device of a cat with progress (that cat
 could not be reached again). In `claude -p` nobody can be asked, so nothing
 switches.
 
-On and off are remembered for the whole machine (the plugin's store), so a new
-session starts the way you left it. `/fishing open` turns fishing back on too;
-the automatic open never does, and opens nothing while fishing is off.
+On and off is one switch for the whole machine, kept in
+`~/.claudefishing/fishing.json` beside the identity: every session reads it
+every 5 seconds, whichever copy of the plugin it runs, and a new session starts
+the way you left it. The server keeps the switch too. While it is off, no
+session on the machine counts, not even one still running a plugin from before
+0.3.0, and turning it off closes the game window the machine opened (the page
+closes itself, or says fishing is off if the browser will not let it).
+`/fishing off` always counts as a flip, so typing it again closes a window
+opened since. `/fishing open` turns fishing back on too; the automatic open
+never does, and opens nothing while fishing is off.
+
+Sessions still on a plugin before 0.3.0 follow the switch at their next
+keepalive (they read it from the plugin's store, which the plugin keeps in step
+with the file), and their own `/fishing on` and `/fishing off` count as a flip
+once a session on 0.3.0 reads the store. A copy of the plugin loaded by hand
+keeps a store of its own: the server leaves its sessions out while fishing is
+off all the same.
 
 The status line shows one of:
 
@@ -154,22 +168,25 @@ Every request goes to `serverUrl` with `Authorization: Bearer <secret>`.
   (Claude starts or stops working or starts waiting on you, the model or
   effort changes, activity after 5 idle minutes), every 5 s for up to 45 s
   after the session opens the game (until the answer says its window joined),
-  else as a keepalive once nothing was sent for 60 s, and once when the
-  session ends or you turn fishing off:
+  else as a keepalive once nothing was sent for 60 s, once when the session
+  ends, and once when fishing goes off (again a minute later while the server
+  does not answer it):
 
   | Field | |
   | --- | --- |
   | `sessionId` | the Claude Code session id |
-  | `enabled` | `false` once, when you turn fishing off |
+  | `enabled` | `false` once, when fishing goes off |
   | `ending` | `true` once, when the session ends; after `/clear` or `/resume`, once the next conversation has sent its first heartbeat |
   | `model` | the model id the last main-loop request used (`claude-opus-5-5`), or the one `/model` switched to, else the session's |
   | `effort` | the last request's effort (`low` … `max`); null before this session's first turn, after a `/model` switch until the next request, and for a model without effort |
   | `working` | a turn or a subagent is running right now and Claude is not waiting on you |
   | `activeAgoMs` | milliseconds since Claude last started a turn, made a model request, called a tool, got a tool's result or finished a turn; null before any |
   | `modVersion` | this plugin's version (a server may refuse versions older than its minimum) |
+  | `fishing` | the machine's switch, `{ on, rev }`: `rev` counts the flips, so the server keeps the newest. The answer has the server's, which wins when newer (the file was lost, say) |
 
 * **`POST /api/pair`** `{ sessionId, reason: 'auto' | 'manual' }` when the game
-  is opened.
+  is opened. The server skips `auto` while fishing is off on the machine;
+  `manual` (`/fishing open`) turns it on.
 * **`POST /api/link`** `{}` on `/fishing link`; **`POST /api/link/claim`**
   `{ code, sessionId, replace }` on `/fishing link <code>` (`replace` is true
   only after you chose to switch); **`POST /api/unlink`** `{ sessionId,
@@ -203,7 +220,8 @@ claude --plugin-dir /path/to/claudefishing \
   --settings '{"pluginConfigs":{"claudefishing":{"options":{"serverUrl":"http://localhost:8790","autoOpen":false}}}}'
 ```
 
-Use `CLAUDEFISHING_HOME` to choose a separate test identity. To copy the mod
+Use `CLAUDEFISHING_HOME` to choose a separate test identity (and on/off
+switch). To copy the mod
 into an existing hot-reload session, name that session explicitly:
 
 ```sh

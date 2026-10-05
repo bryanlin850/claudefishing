@@ -1,8 +1,8 @@
 {
-  "version": "0.2.2",
+  "version": "0.3.0",
   "updateCommand": "claude plugin marketplace update claudefishing && claude plugin update claudefishing@claudefishing",
   "contract": {
     "path": "types/protocol.ts",
-    "sha256": "b9703eb6e3fb57a10d172431edbb6aa994947e5596d37dc4b3af9b3f8e2e66e7"
+    "sha256": "7d628844dbf1ae289a23c6d8e1ef996f789b8409760ace788d724df4a9d7b77f"
   }
 }

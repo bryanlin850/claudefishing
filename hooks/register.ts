@@ -3,12 +3,19 @@
 // playable), which model/effort it runs and whether Claude is working (the
 // buff); /fishing opens the game, turns reporting on/off, shows status and
 // links devices so they play one cat.
+//
+// On and off are one switch for the whole machine: a file beside the
+// identity, which every session and every copy of the plugin reads. Each
+// flip is numbered, every heartbeat carries the switch, and the server keeps
+// each machine's newest: while it is off, no session of the machine counts,
+// not even one running an older plugin that never reads the file.
 
 import type { EngineInterface, Register } from 'claude-code'
 import { MOD_VERSION } from '../types/version'
 
 import type { FishingActivity, FishingStep, FishingTurn } from '../types'
 import type {
+  FishingSwitch,
   HeartbeatRequest,
   HeartbeatResponse,
   LinkClaimRequest,
@@ -32,6 +39,8 @@ const OPENING_MS = 45_000
 const HTTP_TIMEOUT_MS = 4_000
 /** /fishing off waits this long for a beat in flight, so its enabled:false lands after it. */
 const OFF_INFLIGHT_WAIT_MS = 300
+/** The switch before anyone flips it: on, no flips yet. */
+const FIRST_SWITCH: FishingSwitch = { on: true, rev: 0 }
 /** session.end has ~1.5 s for the whole chain: an exit spends at most this telling the server (its TTL drops the session anyway). */
 const END_TIMEOUT_MS = 600
 /** A beat already under way for a session id that just ended is dropped for this long; a later return to the id (/resume) beats again. */
@@ -66,8 +75,13 @@ type Reply = { ok: true; json: unknown } | { ok: false; error: string; status?: 
 type Runtime = {
   serverUrl: string
   autoOpen: boolean
-  /** /fishing on|off, shared by every session on the machine through $.store. */
+  /** This session acts on: reports while on; turned off it went quiet. Follows `fishing.on` within a tick. */
   enabled: boolean
+  /** The machine's switch as this session last read it (the file, ~/.claudefishing/fishing.json). */
+  fishing: FishingSwitch
+  fishingPath: string | null
+  /** The flip whose off the server answered (null: none yet): an off it never heard is sent again. */
+  offSentRev: number | null
   identityPath: string | null
   identity: Identity | null
   identityError: string | null
@@ -154,12 +168,17 @@ function asHeartbeatResponse(json: unknown): HeartbeatResponse | null {
 
 // ─── identity ──────────────────────────────────────────────────────────────
 
-async function identityPath($: EngineInterface): Promise<string> {
+/** ~/.claudefishing, where the identity and the switch live. */
+async function homeDir($: EngineInterface): Promise<string> {
   // $.fs does not expand "~" (it resolves against the session cwd): build it from HOME.
   const override = await $.env.get('CLAUDEFISHING_HOME')
-  if (override) return `${override.replace(/\/+$/, '')}/identity.json`
+  if (override) return override.replace(/\/+$/, '')
   const home = (await $.env.get('HOME')) ?? (await $.env.get('USERPROFILE')) ?? '.'
-  return `${home}/.claudefishing/identity.json`
+  return `${home}/.claudefishing`
+}
+
+async function identityPath($: EngineInterface): Promise<string> {
+  return `${await homeDir($)}/identity.json`
 }
 
 function parseIdentity(text: string): Identity | null {
@@ -227,6 +246,97 @@ function ensureIdentity($: EngineInterface, rt: Runtime): Promise<Identity | nul
   return rt.identityLoad
 }
 
+// ─── the switch ────────────────────────────────────────────────────────────
+// /fishing on|off for the whole machine, in ~/.claudefishing/fishing.json. Plugins
+// before 0.3.0 kept it as `enabled` in $.store, which is one file per install (the
+// marketplace's, a hand-loaded copy's): each install's store is kept in step with
+// the file, so their sessions go on and off with it too. `switchRev` stamps the flip
+// a store was last brought to; `enabled` changed under that same stamp is an older
+// plugin's /fishing on|off, which counts as one flip more.
+
+function isSwitch(value: unknown): value is FishingSwitch {
+  const s = value as Partial<FishingSwitch> | null
+  return typeof s === 'object' && s !== null && typeof s.on === 'boolean' && Number.isSafeInteger(s.rev) && (s.rev as number) >= 0
+}
+
+function isSameSwitch(a: FishingSwitch, b: FishingSwitch): boolean {
+  return a.on === b.on && a.rev === b.rev
+}
+
+/** The file; FIRST_SWITCH while there is none, null when it does not read as a switch (being written, or edited by hand). */
+async function readSwitchFile($: EngineInterface, rt: Runtime): Promise<FishingSwitch | null> {
+  rt.fishingPath ??= `${await homeDir($)}/fishing.json`
+  if (!(await $.fs.exists(rt.fishingPath))) return FIRST_SWITCH
+  try {
+    const parsed: unknown = JSON.parse(await $.fs.read(rt.fishingPath))
+    return isSwitch(parsed) ? { on: parsed.on, rev: parsed.rev } : null
+  } catch {
+    return null
+  }
+}
+
+// Whole or not at all: other sessions read it every few seconds.
+async function writeSwitchFile($: EngineInterface, rt: Runtime, fishing: FishingSwitch): Promise<void> {
+  rt.fishingPath ??= `${await homeDir($)}/fishing.json`
+  const text = `${JSON.stringify({ on: fishing.on, rev: fishing.rev })}\n`
+  const tmp = `${rt.fishingPath}.${hex(crypto.getRandomValues(new Uint8Array(6)))}.tmp`
+  await $.fs.write(tmp, text)
+  const moved = await $.process.run(['mv', tmp, rt.fishingPath]).catch(() => null)
+  if (moved?.exitCode === 0) return
+  await $.process.run(['rm', '-f', tmp]).catch(() => undefined)
+  await $.fs.write(rt.fishingPath, text) // no mv on this system
+}
+
+/** This install's store, as plugins before 0.3.0 read it. `enabled` goes first: a stamp never covers a value it does not stand for. */
+async function syncStore($: EngineInterface, fishing: FishingSwitch): Promise<void> {
+  await $.store.set('enabled', fishing.on)
+  await $.store.set('switchRev', fishing.rev)
+}
+
+/** The machine's switch, with what an older plugin in this install did to it since; this install's store follows it. */
+async function loadSwitch($: EngineInterface, rt: Runtime): Promise<FishingSwitch> {
+  const file = await readSwitchFile($, rt)
+  if (file === null) return rt.fishing
+  const enabled = await $.store.get('enabled')
+  const stamp = await $.store.get('switchRev')
+  const stored = typeof enabled === 'boolean' ? enabled : null
+  let fishing = file
+  if (Number.isSafeInteger(stamp)) {
+    const rev = stamp as number
+    // An older plugin flipped `enabled` under the stamp: one flip more. A stamp ahead of the file: the file was lost.
+    if (rev === file.rev && stored !== null && stored !== file.on) fishing = { on: stored, rev: file.rev + 1 }
+    else if (rev > file.rev) fishing = { on: stored !== false, rev }
+  } else if (stored === false && isSameSwitch(file, FIRST_SWITCH)) {
+    fishing = { on: false, rev: 1 } // turned off before 0.3.0: the first flip
+  }
+  if (!isSameSwitch(fishing, file)) await writeSwitchFile($, rt, fishing)
+  if (stored !== fishing.on || stamp !== fishing.rev) await syncStore($, fishing)
+  rt.fishing = fishing
+  return fishing
+}
+
+/** /fishing on|off: one flip more, for every session of the machine (and, with the next beat, the server). */
+async function flip($: EngineInterface, rt: Runtime, on: boolean): Promise<FishingSwitch> {
+  const before = await loadSwitch($, rt)
+  const fishing = { on, rev: before.rev + 1 }
+  await writeSwitchFile($, rt, fishing)
+  await syncStore($, fishing)
+  rt.fishing = fishing
+  return fishing
+}
+
+/** The server's switch, when newer than this session's: a lost file, or the same flip settled the other way. True when taken. */
+async function adoptServerSwitch($: EngineInterface, rt: Runtime, theirs: unknown): Promise<boolean> {
+  if (!isSwitch(theirs)) return false
+  const ours = rt.fishing
+  if (theirs.rev < ours.rev || (theirs.rev === ours.rev && theirs.on === ours.on)) return false
+  const fishing = { on: theirs.on, rev: theirs.rev }
+  await writeSwitchFile($, rt, fishing)
+  await syncStore($, fishing)
+  rt.fishing = fishing
+  return true
+}
+
 // ─── HTTP ──────────────────────────────────────────────────────────────────
 
 // $.http.fetch has no timeout or signal: race it against $.clock.sleep (the fetch is abandoned, not aborted).
@@ -271,22 +381,35 @@ async function heartbeatBody($: EngineInterface, rt: Runtime, sessionId: string,
     working: isWorking(rt, now),
     activeAgoMs: lastActiveAt === null ? null : Math.max(0, now - lastActiveAt),
     modVersion: MOD_VERSION,
+    fishing: { on: rt.fishing.on, rev: rt.fishing.rev },
   }
 }
 
-function applyReply(rt: Runtime, reply: Reply): void {
+function applyReply(rt: Runtime, reply: Reply): HeartbeatResponse | null {
   const res = reply.ok ? asHeartbeatResponse(reply.json) : null
   rt.link = res !== null ? 'online' : 'offline'
   rt.linkError = res !== null ? null : reply.ok ? 'unexpected answer' : reply.error
   rt.last = res ?? rt.last
   if (res?.clientConnected === true) rt.openingUntil = null // the awaited window joined
+  return res
+}
+
+/** This session is quiet from now on (the server knows: `offSentRev` is the off it heard). */
+function stopReporting(rt: Runtime, offSentRev: number | null): void {
+  rt.enabled = false
+  rt.lastSentWorking = null
+  rt.openingUntil = null
+  rt.offSentRev = offSentRev
+  rt.link = 'unknown'
+  rt.last = null
 }
 
 async function beat($: EngineInterface, rt: Runtime): Promise<void> {
-  // /fishing on|off may have run in another session on this machine.
-  const enabled = (await $.store.get('enabled')) !== false
-  if (!enabled) {
-    if (rt.enabled) await turnOff($, rt)
+  // /fishing on|off may have run in another session, or another copy of the plugin, on this machine.
+  const fishing = await loadSwitch($, rt).catch(() => rt.fishing)
+  if (!fishing.on) {
+    // The server hears of an off once from each session (and again, while it never answers).
+    if (rt.enabled || rt.offSentRev !== fishing.rev) await turnOff($, rt)
     $.ui.status('🎣 off')
     return
   }
@@ -311,7 +434,13 @@ async function beat($: EngineInterface, rt: Runtime): Promise<void> {
   if (rt.inFlight === request) rt.inFlight = null
   if (seq < rt.appliedSeq || !rt.enabled) return
   rt.appliedSeq = seq
-  applyReply(rt, reply)
+  const res = applyReply(rt, reply)
+  // The server has a newer switch: off, this session goes quiet at once (the server already said so).
+  if (res !== null && (await adoptServerSwitch($, rt, res.fishing).catch(() => false)) && !rt.fishing.on) {
+    stopReporting(rt, rt.fishing.rev)
+    $.ui.status('🎣 off')
+    return
+  }
   $.ui.status(statusLine(rt))
   toastUpdate($, rt)
   if (rt.isAutoOpenPending && rt.link === 'online') void autoOpenSafely($, rt)
@@ -348,16 +477,24 @@ function queueBeat($: EngineInterface, rt: Runtime): void {
 
 // A keepalive once the server has heard nothing for KEEPALIVE_MS, a beat as soon as a turn goes
 // stale (STALE_TURN_MS) and stops counting as work, and one every tick while a window this session
-// opened has not joined (the server only says so in a beat's answer): time alone changes nothing else.
+// opened has not joined (the server only says so in a beat's answer). The switch is read every tick
+// (no network): a flip anywhere on the machine reaches this session within one.
 async function tick($: EngineInterface, rt: Runtime): Promise<void> {
   const now = await $.clock.now()
   if (rt.openingUntil !== null && now >= rt.openingUntil) {
     rt.openingUntil = null // it never joined: "game closed" again, and keepalives only
     $.ui.status(statusLine(rt))
   }
+  const fishing = await loadSwitch($, rt).catch(() => rt.fishing)
+  if (fishing.on !== rt.enabled) return runBeat($, rt)
+  if (!fishing.on) {
+    // An off the server never answered goes again, a keepalive after the last try.
+    if (rt.offSentRev !== fishing.rev && (rt.lastBeatAt === null || now - rt.lastBeatAt >= KEEPALIVE_MS)) await runBeat($, rt)
+    return
+  }
   const isStale = rt.lastSentWorking === true && !isWorking(rt, now)
   if (rt.openingUntil === null && !isStale && rt.lastBeatAt !== null && now - rt.lastBeatAt < KEEPALIVE_MS) return
-  // Counted as a beat even if it cannot be sent (offline, fishing off): the next try is a keepalive later.
+  // Counted as a beat even if it cannot be sent (offline): the next try is a keepalive later.
   rt.lastBeatAt = now
   await runBeat($, rt)
 }
@@ -368,29 +505,31 @@ function startTimer($: EngineInterface, rt: Runtime): void {
   rt.timer = $.clock.every(TICK_MS, () => void tick($, rt))
 }
 
-// The store is what every beat reads, this machine's other sessions' included.
+// /fishing on, and /fishing open when off: a flip on, which every session of the machine follows.
 async function turnOn($: EngineInterface, rt: Runtime): Promise<void> {
-  await $.store.set('enabled', true)
+  await flip($, rt, true)
   rt.enabled = true
   startTimer($, rt)
   await runBeat($, rt)
 }
 
-// Tell the server to drop this session now rather than after its TTL.
+// The server drops this session now rather than after its TTL. An off it has not heard of yet (a
+// newer flip) drops every session of the machine and closes the game window the machine opened.
 async function turnOff($: EngineInterface, rt: Runtime): Promise<void> {
-  rt.enabled = false
-  rt.lastSentWorking = null
-  rt.openingUntil = null
+  const fishing = rt.fishing
+  stopReporting(rt, rt.offSentRev)
   if (rt.inFlight !== null) await Promise.race([rt.inFlight, $.clock.sleep(OFF_INFLIGHT_WAIT_MS)]) // land it first
   const identity = rt.identity
   const sessionId = await $.session.id()
   const now = await $.clock.now()
-  if (identity !== null && !isRecentlyEnded(rt, sessionId, now)) {
-    const body = await heartbeatBody($, rt, sessionId, now)
-    await postJson($, rt, '/api/heartbeat', identity.secret, { ...body, enabled: false }, HTTP_TIMEOUT_MS)
-  }
-  rt.link = 'unknown'
-  rt.last = null
+  rt.lastBeatAt = now // a try that gets no answer goes again a keepalive later
+  if (identity === null || isRecentlyEnded(rt, sessionId, now)) return
+  const body = await heartbeatBody($, rt, sessionId, now)
+  const reply = await postJson($, rt, '/api/heartbeat', identity.secret, { ...body, enabled: false }, HTTP_TIMEOUT_MS)
+  if (!reply.ok) return
+  // Heard (a server from before the switch hears it too): sent. A newer switch there wins; on, the next tick resumes.
+  rt.offSentRev = fishing.rev
+  await adoptServerSwitch($, rt, asHeartbeatResponse(reply.json)?.fishing).catch(() => false)
 }
 
 async function sendEnding($: EngineInterface, rt: Runtime, sessionId: string, timeoutMs: number): Promise<void> {
@@ -515,7 +654,8 @@ async function openGame($: EngineInterface, rt: Runtime, reason: PairRequest['re
   const pair = reply.json as PairResponse | null
   if (pair === null || typeof pair !== 'object') return { kind: 'failed', text: 'unexpected answer from the server' }
   if (pair.ok === false) {
-    return { kind: 'skipped', text: pair.skipped === 'client-connected' ? 'the game is already open' : 'the game was opened moments ago' }
+    const why = { 'client-connected': 'the game is already open', 'recently-opened': 'the game was opened moments ago', 'fishing-off': 'fishing is off on this machine' }
+    return { kind: 'skipped', text: why[pair.skipped] ?? why['recently-opened'] }
   }
   if (typeof pair.code !== 'string') return { kind: 'failed', text: 'unexpected answer from the server' }
   const url = `${rt.serverUrl}/#pair=${encodeURIComponent(pair.code)}`
@@ -731,6 +871,9 @@ export const register: Register = (on, options) => {
     serverUrl: (typeof options.serverUrl === 'string' && options.serverUrl.trim() !== '' ? options.serverUrl.trim() : DEFAULT_SERVER_URL).replace(/\/+$/, ''),
     autoOpen: options.autoOpen !== false,
     enabled: true,
+    fishing: FIRST_SWITCH,
+    fishingPath: null,
+    offSentRev: null,
     identityPath: null,
     identity: null,
     identityError: null,
@@ -762,7 +905,6 @@ export const register: Register = (on, options) => {
       description: 'claudefishing: status | open | on | off | link | unlink',
       argumentHint: '[status|open|on|off|link [code]|unlink]',
     })
-    rt.enabled = (await $.store.get('enabled')) !== false
     const { value: activity } = await $.state.get(ACTIVITY)
     if (activity !== undefined) rt.activity = activity
     // A reload mid-turn keeps the turn, its subagents and a prompt waiting on the person.
@@ -770,7 +912,8 @@ export const register: Register = (on, options) => {
     if (turn !== undefined) rt.turn = turn
     const { value: autoOpenState } = await $.state.get(AUTO_OPEN)
     rt.isAutoOpenPending = autoOpenState === 'pending'
-    await ensureIdentity($, rt)
+    await ensureIdentity($, rt) // first: it makes ~/.claudefishing owner-only
+    rt.enabled = (await loadSwitch($, rt).catch(() => rt.fishing)).on
     startTimer($, rt)
     if (!rt.enabled) $.ui.status('🎣 off')
     // session.start is awaited before the first prompt: the network goes in a timer, not here.
@@ -855,25 +998,31 @@ export const register: Register = (on, options) => {
     if (arg === 'link') return { text: rest.length === 0 ? await createLink($, rt) : await claimLink($, rt, rest.join(' ')) }
     if (arg === 'unlink') return { text: await unlinkMachine($, rt) }
     if (arg === 'on') {
-      await turnOn($, rt)
+      const failed = await turnOn($, rt).then(() => null, errorText)
+      if (failed !== null) return { text: `fishing stays as it was: the switch could not be saved (${failed})` }
       return { text: `fishing on: ${statusLine(rt) ?? '🎣 connecting'} (${rt.serverUrl})` }
     }
     if (arg === 'off') {
-      await $.store.set('enabled', false)
-      if (rt.enabled) await turnOff($, rt).catch(() => undefined)
+      // Always one flip more, even when off already: the server closes any window this machine opened since.
+      const failed = await flip($, rt, false).then(() => null, errorText)
+      if (failed !== null) return { text: `fishing stays as it was: the switch could not be saved (${failed})` }
+      await turnOff($, rt).catch(() => undefined)
       $.ui.status('🎣 off')
-      return { text: 'fishing off: sessions on this machine stop reporting to the game. /fishing on resumes.' }
+      return { text: 'fishing off: no session on this machine reports to the game, and its game window closes. /fishing on resumes.' }
     }
     if (arg === 'open') {
-      // Asking for the game is asking to play: off, it would open locked. The store, as another session may have
-      // switched it; the beat lands before the pair. The auto-open never turns fishing on.
-      const wasOff = (await $.store.get('enabled')) === false
-      if (wasOff) await turnOn($, rt)
+      // Asking for the game is asking to play: off, it would open locked. The switch, as another session may have
+      // flipped it; the beat lands before the pair. The auto-open never turns fishing on.
+      const wasOff = !(await loadSwitch($, rt).catch(() => rt.fishing)).on
+      if (wasOff) {
+        const failed = await turnOn($, rt).then(() => null, errorText)
+        if (failed !== null) return { text: `fishing stays off: the switch could not be saved (${failed})` }
+      }
       const result = await openGame($, rt, 'manual')
       return { text: wasOff ? `fishing on · ${result.text}` : result.text }
     }
     if (arg !== 'status') return { text: USAGE }
-    if (rt.enabled) await runBeat($, rt)
+    await runBeat($, rt) // on: fresh numbers; off: a flip elsewhere shows
     return { text: await statusReport($, rt) }
   })
 

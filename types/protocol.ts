@@ -7,7 +7,7 @@ export type EffortLevel = 'low' | 'medium' | 'high' | 'xhigh' | 'max'
 export type HeartbeatRequest = {
   /** The Claude Code session id. */
   sessionId: string
-  /** false = the person turned fishing off in this session: drop it now. */
+  /** false = fishing is off (`fishing` says for the whole machine): drop this session now. */
   enabled: boolean
   /** true on session end: drop this session now. */
   ending?: boolean
@@ -21,7 +21,19 @@ export type HeartbeatRequest = {
   activeAgoMs: number | null
   /** Mod version: a session older than the server's minimum counts for nothing. */
   modVersion?: string
+  /**
+   * The machine's /fishing on|off as this session read it. The server keeps each machine's newest
+   * (highest `rev`): while it is off no session of the machine counts, an older plugin's included,
+   * and the flip to off closes the game window the machine opened. Absent from plugins before 0.3.0.
+   */
+  fishing?: FishingSwitch
 }
+
+/**
+ * /fishing on|off for a whole machine, shared by every session and every copy of the plugin on it.
+ * `rev` counts the flips: of two, the higher is the newer.
+ */
+export type FishingSwitch = { on: boolean; rev: number }
 
 /**
  * The plugin is older than the latest (`latest`). `required`: older than the server's minimum
@@ -65,6 +77,11 @@ export type HeartbeatResponse = {
   presence: PresenceView
   /** This session's plugin is behind (null: up to date). Absent from servers before 0.2.0. */
   modUpdate?: ModUpdate | null
+  /**
+   * The machine's switch as the server keeps it. Newer than the plugin's (a higher `rev`, or the
+   * same flip settled the other way), it is the switch. Absent from servers before 0.3.0.
+   */
+  fishing?: FishingSwitch
 }
 
 /** What a cat has to show for itself, as the mod prints it. */
@@ -72,13 +89,16 @@ export type PlayerSummary = { name: string; level: number; rank: string; money: 
 
 export type PairRequest = {
   sessionId: string
-  /** 'auto' (session start) is skipped while a window is connected or one was opened moments ago; 'manual' always pairs. */
+  /**
+   * 'auto' (session start) is skipped while a window is connected, one was opened moments ago, or
+   * fishing is off on the machine; 'manual' always pairs, and turns an off machine on.
+   */
   reason: 'auto' | 'manual'
 }
 
 export type PairResponse =
   | { ok: true; code: string; expiresAt: number }
-  | { ok: false; skipped: 'client-connected' | 'recently-opened' }
+  | { ok: false; skipped: 'client-connected' | 'recently-opened' | 'fishing-off' }
 
 // A machine plays its own cat (the player whose id is the machine's) until it
 // claims a link code made on a machine that plays another one; from then on

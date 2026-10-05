@@ -2,7 +2,7 @@ import type { On } from 'claude-code'
 import { MOD_VERSION } from '../types/version'
 import { describe, expect, mock, test } from 'claude-code/testing'
 
-import type { HeartbeatResponse, ModUpdate, PlayerSummary } from '../types/protocol'
+import type { FishingSwitch, HeartbeatResponse, ModUpdate, PlayerSummary } from '../types/protocol'
 
 type Sent = { url: string; auth: string | undefined; body: Record<string, unknown>; at: number }
 
@@ -19,6 +19,8 @@ type ServerState = {
   linked: boolean
   /** The heartbeat answer's word on this session's plugin (null: up to date). */
   modUpdate: ModUpdate | null
+  /** The machine's switch as the server keeps it (null: a server from before the switch). */
+  fishing: FishingSwitch | null
   pair: Record<string, unknown>
   /** Answers by path ('/api/link/claim'), from the request body; heartbeat and pair answer from the fields above. */
   answers: Record<string, (body: Record<string, unknown>) => Answer>
@@ -37,6 +39,7 @@ type WorldOptions = {
 }
 
 const IDENTITY = '/home/cat/.claudefishing/identity.json'
+const FISHING_FILE = '/home/cat/.claudefishing/fishing.json'
 const SECRET = 'ab'.repeat(32)
 const TMP = /^\/home\/cat\/\.claudefishing\/identity\.json\.[0-9a-f]{12}\.tmp$/
 
@@ -58,6 +61,7 @@ function heartbeatResponse(server: ServerState): HeartbeatResponse {
       modUpdate: server.modUpdate,
     },
     modUpdate: server.modUpdate,
+    ...(server.fishing !== null ? { fishing: server.fishing } : {}),
   }
 }
 
@@ -84,6 +88,7 @@ function world(on: On, opts: WorldOptions = {}) {
     machines: 1,
     linked: false,
     modUpdate: null,
+    fishing: null,
     pair: { ok: true, code: 'K7Q2ZP', expiresAt: 9_999_999 },
     answers: {},
   }
@@ -94,7 +99,19 @@ function world(on: On, opts: WorldOptions = {}) {
   /** Runs before a $.fs.write lands: another process acting meanwhile. */
   const beforeWrite: { run: ((path: string) => void) | null } = { run: null }
   const clock = mock.clock(on, { now: 1_000_000 })
-  mock.store(on, opts.store)
+  /** $.store: this install's, as plugins before 0.3.0 read it. */
+  const store = new Map(Object.entries(opts.store ?? {}))
+  on('store.get', ($, e) => ({ value: store.get((e as { key: string }).key) }) as never)
+  on('store.set', ($, e) => {
+    const { key, value } = e as { key: string; value: unknown }
+    store.set(key, JSON.parse(JSON.stringify(value)))
+    return { value: undefined } as never
+  })
+  on('store.delete', ($, e) => {
+    store.delete((e as { key: string }).key)
+    return { value: undefined } as never
+  })
+  on('store.keys', () => ({ value: [...store.keys()] }) as never)
   mock.env(on, { HOME: '/home/cat' })
   on('state.get', ($, e) => ({ value: { value: state.get((e as { key: string }).key), version: 0 } }) as never)
   on('state.set', ($, e) => {
@@ -192,7 +209,12 @@ function world(on: On, opts: WorldOptions = {}) {
   const lastBeat = () => beats().at(-1)?.body
   /** Requests to one route ('/api/link/claim'). */
   const to = (path: string) => sent.filter(s => s.url.endsWith(path))
-  return { files, state, sent, beats, lastBeat, pairs, to, statuses, toasts, copies, asks, person, argvs, clock, session, server, toolMs, permission, beforeWrite }
+  /** The machine's switch as the file has it (undefined: no file). */
+  const fishing = (): FishingSwitch | undefined => {
+    const text = files.get(FISHING_FILE)
+    return text === undefined ? undefined : JSON.parse(text)
+  }
+  return { files, state, store, fishing, sent, beats, lastBeat, pairs, to, statuses, toasts, copies, asks, person, argvs, clock, session, server, toolMs, permission, beforeWrite }
 }
 
 const START = { cwd: '/proj', surface: null, isInteractive: false } as const
@@ -291,6 +313,7 @@ describe('heartbeats', () => {
       working: false,
       activeAgoMs: null,
       modVersion: MOD_VERSION,
+      fishing: { on: true, rev: 0 },
     })
   })
 
@@ -699,11 +722,13 @@ describe('/fishing', () => {
     expect(w.sent).toHaveLength(count + 2)
   })
 
-  test('off is remembered for new sessions on the machine', async ($, on) => {
-    const w = world(on, { store: { enabled: false } })
+  test('off is remembered for new sessions on the machine: the server hears it once, nothing opens', async ($, on) => {
+    const w = world(on, { files: { [FISHING_FILE]: '{"on":false,"rev":3}\n' } })
     await $.session.start({ ...START, isInteractive: true })
     await w.clock.advance(60_000)
-    expect(w.sent).toEqual([])
+    expect(w.sent.map(s => s.body)).toEqual([expect.objectContaining({ enabled: false, fishing: { on: false, rev: 3 } })])
+    await w.clock.advance(120_000)
+    expect(w.sent).toHaveLength(1)
     expect(w.statuses.at(-1)).toBe('🎣 off')
   })
 
@@ -717,14 +742,16 @@ describe('/fishing', () => {
   })
 
   test('open turns fishing on first when it is off, so the game does not open locked', async ($, on) => {
-    const w = world(on, { store: { enabled: false } })
+    const w = world(on, { files: { [FISHING_FILE]: '{"on":false,"rev":1}\n' } })
     await $.session.start(START)
     await w.clock.settle()
-    expect(w.sent).toEqual([])
+    expect(w.sent.map(s => s.body.enabled)).toEqual([false]) // the off, told once
+    w.sent.length = 0
     const { text } = await $.command.run({ command: 'fishing', args: 'open', ...TYPED })
     expect(text).toBe('fishing on · opened in a Chrome app window')
     expect(w.sent.map(s => s.url.replace('https://claudefishing.io', ''))).toEqual(['/api/heartbeat', '/api/pair'])
-    expect(w.lastBeat()).toEqual(expect.objectContaining({ sessionId: 'sess-1', enabled: true }))
+    expect(w.lastBeat()).toEqual(expect.objectContaining({ sessionId: 'sess-1', enabled: true, fishing: { on: true, rev: 2 } }))
+    expect(w.fishing()).toEqual({ on: true, rev: 2 })
     expect(w.statuses.at(-1)).toBe('🎣 opening game')
     w.server.clientConnected = true
     await w.clock.advance(60_000)
@@ -745,6 +772,161 @@ describe('/fishing', () => {
     await $.session.start(START)
     const { text } = await $.command.run({ command: 'fishing', args: 'fly', ...TYPED })
     expect(text).toBe('usage: /fishing [status|open|on|off|link [code]|unlink]')
+  })
+})
+
+describe('the switch', () => {
+  test("off and on flip the machine's switch: the file, this install's store and every beat carry it", async ($, on) => {
+    const w = world(on)
+    await $.session.start(START)
+    await w.clock.settle()
+    expect(w.fishing()).toBeUndefined() // never flipped: no file
+    expect(w.lastBeat()?.fishing).toEqual({ on: true, rev: 0 })
+
+    await $.command.run({ command: 'fishing', args: 'off', ...TYPED })
+    expect(w.fishing()).toEqual({ on: false, rev: 1 })
+    expect([w.store.get('enabled'), w.store.get('switchRev')]).toEqual([false, 1])
+    expect(w.lastBeat()).toEqual(expect.objectContaining({ enabled: false, fishing: { on: false, rev: 1 } }))
+    // Off again: one flip more, told again (the server closes any window opened since).
+    await $.command.run({ command: 'fishing', args: 'off', ...TYPED })
+    expect(w.lastBeat()).toEqual(expect.objectContaining({ enabled: false, fishing: { on: false, rev: 2 } }))
+
+    await $.command.run({ command: 'fishing', args: 'on', ...TYPED })
+    expect(w.fishing()).toEqual({ on: true, rev: 3 })
+    expect([w.store.get('enabled'), w.store.get('switchRev')]).toEqual([true, 3])
+    expect(w.lastBeat()).toEqual(expect.objectContaining({ enabled: true, fishing: { on: true, rev: 3 } }))
+    // Written whole: a temp file, moved over the switch.
+    expect(w.argvs.filter(a => a[0] === 'mv').map(a => a[2])).toEqual([FISHING_FILE, FISHING_FILE, FISHING_FILE])
+    expect([...w.files.keys()].filter(k => k.endsWith('.tmp'))).toEqual([])
+  })
+
+  test("another session's flip reaches this one within a tick, both ways", async ($, on) => {
+    const w = world(on)
+    await $.session.start(START)
+    await w.clock.settle()
+    const count = w.sent.length
+    w.files.set(FISHING_FILE, '{"on":false,"rev":1}\n') // /fishing off in another session
+    await w.clock.advance(5_000)
+    expect(w.sent).toHaveLength(count + 1)
+    expect(w.lastBeat()).toEqual(expect.objectContaining({ enabled: false, fishing: { on: false, rev: 1 } }))
+    expect(w.statuses.at(-1)).toBe('🎣 off')
+    await w.clock.advance(120_000)
+    expect(w.sent).toHaveLength(count + 1)
+
+    w.files.set(FISHING_FILE, '{"on":true,"rev":2}\n')
+    await w.clock.advance(5_000)
+    expect(w.sent).toHaveLength(count + 2)
+    expect(w.lastBeat()).toEqual(expect.objectContaining({ enabled: true, fishing: { on: true, rev: 2 } }))
+    expect(w.statuses.at(-1)).toBe('🎣 game closed')
+  })
+
+  test('an off the server never answered goes again a keepalive later, until it is', async ($, on) => {
+    const w = world(on)
+    await $.session.start(START)
+    await w.clock.settle()
+    w.server.hang = true
+    const off = $.command.run({ command: 'fishing', args: 'off', ...TYPED })
+    await w.clock.advance(4_000) // no answer
+    await off
+    const count = w.beats().length
+    await w.clock.advance(55_000)
+    expect(w.beats()).toHaveLength(count)
+    await w.clock.advance(5_000) // a keepalive after the try: again (no answer either)
+    expect(w.beats()).toHaveLength(count + 1)
+    expect(w.lastBeat()).toEqual(expect.objectContaining({ enabled: false, fishing: { on: false, rev: 1 } }))
+    w.server.hang = false
+    await w.clock.advance(60_000) // and again, answered
+    expect(w.beats()).toHaveLength(count + 2)
+    await w.clock.advance(180_000)
+    expect(w.beats()).toHaveLength(count + 2)
+  })
+
+  test('an off from before 0.3.0 (in the store) is the first flip, and the server hears it once', async ($, on) => {
+    const w = world(on, { store: { enabled: false } })
+    await $.session.start(START)
+    await w.clock.settle()
+    expect(w.fishing()).toEqual({ on: false, rev: 1 })
+    expect([w.store.get('enabled'), w.store.get('switchRev')]).toEqual([false, 1])
+    expect(w.beats().map(b => b.body)).toEqual([expect.objectContaining({ enabled: false, fishing: { on: false, rev: 1 } })])
+    await w.clock.advance(120_000)
+    expect(w.beats()).toHaveLength(1)
+    expect(w.statuses.at(-1)).toBe('🎣 off')
+  })
+
+  test("an older plugin's /fishing off or on in this install counts as one flip more", async ($, on) => {
+    const w = world(on, { files: { [FISHING_FILE]: '{"on":true,"rev":3}\n' }, store: { enabled: true, switchRev: 3 } })
+    await $.session.start(START)
+    await w.clock.settle()
+    w.store.set('enabled', false) // /fishing off in a session still on 0.2
+    await w.clock.advance(5_000)
+    expect(w.fishing()).toEqual({ on: false, rev: 4 })
+    expect(w.store.get('switchRev')).toBe(4)
+    expect(w.lastBeat()).toEqual(expect.objectContaining({ enabled: false, fishing: { on: false, rev: 4 } }))
+    w.store.set('enabled', true) // and /fishing on there
+    await w.clock.advance(5_000)
+    expect(w.fishing()).toEqual({ on: true, rev: 5 })
+    expect(w.lastBeat()).toEqual(expect.objectContaining({ enabled: true, fishing: { on: true, rev: 5 } }))
+  })
+
+  test("a store stamped for an older flip follows the file (another install's, a hand-loaded copy's)", async ($, on) => {
+    const w = world(on, { files: { [FISHING_FILE]: '{"on":false,"rev":5}\n' }, store: { enabled: true, switchRev: 2 } })
+    await $.session.start(START)
+    await w.clock.settle()
+    expect(w.fishing()).toEqual({ on: false, rev: 5 })
+    expect([w.store.get('enabled'), w.store.get('switchRev')]).toEqual([false, 5])
+    expect(w.statuses.at(-1)).toBe('🎣 off')
+  })
+
+  test('a store never stamped follows the file too, once a flip has been made', async ($, on) => {
+    const w = world(on, { files: { [FISHING_FILE]: '{"on":false,"rev":5}\n' }, store: { enabled: true } })
+    await $.session.start(START)
+    await w.clock.settle()
+    expect(w.fishing()).toEqual({ on: false, rev: 5 })
+    expect([w.store.get('enabled'), w.store.get('switchRev')]).toEqual([false, 5])
+  })
+
+  test('a newer switch from the server is taken: off, the session goes quiet without another word', async ($, on) => {
+    const w = world(on)
+    w.server.fishing = { on: false, rev: 4 } // the file was lost; the server kept the machine's switch
+    await $.session.start(START)
+    await w.clock.settle()
+    expect(w.fishing()).toEqual({ on: false, rev: 4 })
+    expect([w.store.get('enabled'), w.store.get('switchRev')]).toEqual([false, 4])
+    expect(w.beats()).toHaveLength(1)
+    expect(w.statuses.at(-1)).toBe('🎣 off')
+    await w.clock.advance(120_000)
+    expect(w.beats()).toHaveLength(1)
+  })
+
+  test('an older switch from the server is not', async ($, on) => {
+    const w = world(on, { files: { [FISHING_FILE]: '{"on":true,"rev":6}\n' } })
+    w.server.fishing = { on: false, rev: 5 }
+    await $.session.start(START)
+    await w.clock.settle()
+    expect(w.fishing()).toEqual({ on: true, rev: 6 })
+    expect(w.statuses.at(-1)).toBe('🎣 game closed')
+  })
+
+  test('the same flip settled on by the server (an older plugin opened the game): taken, and the session resumes', async ($, on) => {
+    const w = world(on, { files: { [FISHING_FILE]: '{"on":false,"rev":2}\n' } })
+    w.server.fishing = { on: true, rev: 2 }
+    await $.session.start(START)
+    await w.clock.settle()
+    expect(w.beats().map(b => b.body.enabled)).toEqual([false]) // the off, told at start, answered with the server's on
+    expect(w.fishing()).toEqual({ on: true, rev: 2 })
+    await w.clock.advance(5_000)
+    expect(w.lastBeat()).toEqual(expect.objectContaining({ enabled: true, fishing: { on: true, rev: 2 } }))
+    expect(w.statuses.at(-1)).toBe('🎣 game closed')
+  })
+
+  test('a switch file that does not read (half written, edited by hand) keeps the last switch', async ($, on) => {
+    const w = world(on)
+    await $.session.start(START)
+    await w.clock.settle()
+    w.files.set(FISHING_FILE, '{"on":fal')
+    await w.clock.advance(65_000)
+    expect(w.statuses.at(-1)).toBe('🎣 game closed')
+    expect(w.lastBeat()).toEqual(expect.objectContaining({ enabled: true, fishing: { on: true, rev: 0 } }))
   })
 })
 
