@@ -225,7 +225,8 @@ on the same machine) with `Authorization: Bearer <secret>`.
     ended;
   * tool calls by tool: Claude Code's own tools by name (`Bash`, `Read`,
     `Edit` …), every MCP tool as `mcp` and anything else as `other`, never
-    which server, plugin, command, file or input;
+    which server, plugin, command, file or input; and how many different MCP
+    servers were called (their names stay in the session, on your machine);
   * the status line's figures at the last measure: how full the context window
     is and its size, your plan's rate-limit windows (percent used and when each
     resets), and what the session has cost so far.

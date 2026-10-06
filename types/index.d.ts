@@ -34,6 +34,7 @@ export type FishingWork = {
   turns: { count: number; aborted: number; failed: number; ms: number }
   agentRuns: number
   tools: Record<string, number>
+  mcpServers: number
   measure: {
     contextPct: number | null
     contextWindow: number
@@ -51,6 +52,8 @@ declare module 'claude-code' {
       turn: FishingTurn
       autoOpen: AutoOpenState
       work: FishingWork
+      /** The MCP servers the run's tool calls went to, by name: kept here to count `work.mcpServers`, never sent. */
+      mcpSeen: string[]
     }
   }
 }

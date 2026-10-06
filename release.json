@@ -3,6 +3,6 @@
   "updateCommand": "claude plugin marketplace update claudefishing && claude plugin update claudefishing@claudefishing",
   "contract": {
     "path": "types/protocol.ts",
-    "sha256": "269bc9de626786b4394d776b804af492e0f7f2dcef4a49890bee81aff1661f1f"
+    "sha256": "64ba71054ad699ba215cdacc764cd75ce45fad699f4e2464609052f7f15f2628"
   }
 }
