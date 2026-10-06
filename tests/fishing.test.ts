@@ -748,6 +748,20 @@ describe('one keepalive per machine', () => {
     expect(w.beats().map(b => b.at)).toEqual([1_000_000, 1_126_000])
   })
 
+  test('of two answers from the same server millisecond, the one written later is written and shown', async ($, on) => {
+    const w = world(on)
+    // Another session's answer, as old as the one this session is about to get.
+    w.files.set(ANSWER_FILE, `${JSON.stringify({ at: 999_000, modVersion: MOD_VERSION, answer: { ...heartbeatResponse(w.server), clientConnected: true } })}\n`)
+    await $.session.start(START)
+    await w.clock.settle()
+    expect(JSON.parse(w.files.get(ANSWER_FILE)!).answer.clientConnected).toBe(false)
+    expect(w.statuses.at(-1)).toBe('🎣 game closed')
+    // And the other way round: the other session's reply lands after this one's.
+    w.files.set(ANSWER_FILE, `${JSON.stringify({ at: w.clock.now(), modVersion: MOD_VERSION, answer: { ...heartbeatResponse(w.server), clientConnected: true } })}\n`)
+    await w.clock.advance(5_000)
+    expect(w.statuses.at(-1)).toBe('🎣 in game')
+  })
+
   test('an answer older than the one in answer.json never replaces it', async ($, on) => {
     const w = world(on)
     const newer = { at: 999_000, modVersion: MOD_VERSION, answer: { ...heartbeatResponse(w.server), serverTime: 6_000_000, clientConnected: true } }
