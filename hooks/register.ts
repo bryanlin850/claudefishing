@@ -88,6 +88,8 @@ const USAGE = 'usage: /fishing [status|open|on|off|link [code]|unlink]'
 /** Models and tools a work report keeps apart: past these, a request counts in the totals only, a tool as "other". */
 const WORK_MODELS = 8
 const WORK_TOOLS = 40
+/** MCP servers a run tells apart; a new one past these is not counted. */
+const WORK_MCP_SERVERS = 64
 /**
  * The only tools a work report names: Claude Code's own (this build's, from its tool types, and a
  * few of older builds'). A plugin can register a tool of any name, and an MCP tool names its server,
@@ -110,6 +112,7 @@ const ACTIVITY = { plugin: 'claudefishing', key: 'activity' } as const
 const TURN = { plugin: 'claudefishing', key: 'turn' } as const
 const AUTO_OPEN = { plugin: 'claudefishing', key: 'autoOpen' } as const
 const WORK = { plugin: 'claudefishing', key: 'work' } as const
+const MCP_SEEN = { plugin: 'claudefishing', key: 'mcpSeen' } as const
 
 type Identity = { secret: string; createdAt: number }
 
@@ -141,6 +144,8 @@ type Runtime = {
   turn: FishingTurn
   /** What Claude did in this session, as every beat carries it. */
   work: WorkReport
+  /** The MCP servers this run's tool calls went to, by name (`work.mcpServers` counts them): never sent. */
+  mcpSeen: string[]
   lastSentWorking: boolean | null
   /** When this session last sent a heartbeat: the next keepalive is due KEEPALIVE_MS after it. */
   lastBeatAt: number | null
@@ -734,18 +739,23 @@ async function sendEnding($: EngineInterface, rt: Runtime, sessionId: string, ti
   await postJson($, rt, '/api/heartbeat', identity.secret, { ...body, work, working: false, ending: true }, timeoutMs)
 }
 
+/** A conversation's run as it ended: its totals, and the MCP servers they count. */
+type EndedRun = { work: WorkReport; mcpSeen: string[] }
+
 // After a /clear or an in-session /resume the process goes on as another conversation: beat as it
 // first, then end the old id (with its totals), so the server never sees this machine without a session.
-async function switchSession($: EngineInterface, rt: Runtime, endedId: string, endedWork: WorkReport): Promise<void> {
+async function switchSession($: EngineInterface, rt: Runtime, endedId: string, ended: EndedRun): Promise<void> {
   let sessionId = await $.session.id()
   for (let i = 0; sessionId === endedId && i < SWITCH_POLLS; i++) {
     await $.clock.sleep(SWITCH_POLL_MS)
     sessionId = await $.session.id()
   }
   if (sessionId === endedId) {
-    // Still the same conversation: nothing to end, and its totals go on.
-    rt.work = endedWork
+    // Still the same conversation: nothing to end, and its run goes on.
+    rt.work = ended.work
+    rt.mcpSeen = ended.mcpSeen
     await $.state.set(WORK, rt.work).catch(() => undefined)
+    await $.state.set(MCP_SEEN, rt.mcpSeen).catch(() => undefined)
     return runBeat($, rt)
   }
   const endedAt = rt.endedAt.get(sessionId)
@@ -756,12 +766,12 @@ async function switchSession($: EngineInterface, rt: Runtime, endedId: string, e
     rt.endedAt.delete(sessionId)
   }
   await runBeat($, rt)
-  await sendEnding($, rt, endedId, HTTP_TIMEOUT_MS, endedWork)
+  await sendEnding($, rt, endedId, HTTP_TIMEOUT_MS, ended.work)
 }
 
-async function switchSessionSafely($: EngineInterface, rt: Runtime, endedId: string, endedWork: WorkReport): Promise<void> {
+async function switchSessionSafely($: EngineInterface, rt: Runtime, endedId: string, ended: EndedRun): Promise<void> {
   try {
-    await switchSession($, rt, endedId, endedWork)
+    await switchSession($, rt, endedId, ended)
   } catch {
     // the timer beats as the new id; the server's TTL drops the old one
   }
@@ -840,6 +850,7 @@ function newWork(): WorkReport {
     turns: { count: 0, aborted: 0, failed: 0, ms: 0 },
     agentRuns: 0,
     tools: {},
+    mcpServers: 0,
     measure: null,
   }
 }
@@ -891,10 +902,16 @@ function countStep(work: WorkReport, result: TurnStepResult): void {
   addTokens(byModel, usage)
 }
 
-function countTool(work: WorkReport, tool: string): void {
+/** True when the call went to an MCP server the run had not seen: `seen` holds the names, the report only how many. */
+function countTool(work: WorkReport, seen: string[], tool: string): boolean {
   const kind = toolKind(tool)
   const key = work.tools[kind] !== undefined || Object.keys(work.tools).length < WORK_TOOLS ? kind : 'other'
   work.tools[key] = (work.tools[key] ?? 0) + 1
+  const server = kind === 'mcp' ? tool.split('__')[1] : undefined
+  if (!server || seen.includes(server) || seen.length >= WORK_MCP_SERVERS) return false
+  seen.push(server)
+  work.mcpServers += 1
+  return true
 }
 
 function countTurn(work: WorkReport, e: TurnCompleteInput): void {
@@ -929,6 +946,21 @@ async function countSafely($: EngineInterface, rt: Runtime, change: (work: WorkR
   } catch {
     // the next count saves it
   }
+}
+
+async function countToolSafely($: EngineInterface, rt: Runtime, tool: string): Promise<void> {
+  try {
+    const isNewServer = countTool(rt.work, rt.mcpSeen, tool)
+    await $.state.set(WORK, rt.work)
+    if (isNewServer) await $.state.set(MCP_SEEN, rt.mcpSeen)
+  } catch {
+    // the next count saves it
+  }
+}
+
+/** The kept server names, from a previous load of the module; anything else is none. */
+function restoreSeen(kept: unknown): string[] {
+  return Array.isArray(kept) ? kept.filter((name): name is string => typeof name === 'string').slice(0, WORK_MCP_SERVERS) : []
 }
 
 // ─── opening the game ──────────────────────────────────────────────────────
@@ -1189,6 +1221,7 @@ export const register: Register = on => {
     activity: { lastActiveAt: null, step: null },
     turn: { running: false, agents: [], waiting: false },
     work: newWork(),
+    mcpSeen: [],
     lastSentWorking: null,
     lastBeatAt: null,
     keepalivePath: null,
@@ -1227,6 +1260,8 @@ export const register: Register = on => {
     // And goes on counting the same run.
     const { value: work } = await $.state.get(WORK)
     rt.work = restoreWork(work)
+    const { value: mcpSeen } = await $.state.get(MCP_SEEN)
+    rt.mcpSeen = restoreSeen(mcpSeen)
     const { value: autoOpenState } = await $.state.get(AUTO_OPEN)
     rt.isAutoOpenPending = autoOpenState === 'pending'
     await ensureIdentity($, rt) // first: it makes ~/.claudefishing owner-only
@@ -1268,7 +1303,7 @@ export const register: Register = on => {
   on('tool.call', async ($, e, next) => {
     // This plugin's own questions (/fishing link) are neither Claude working nor Claude waiting.
     if (next.origin.plugin === $.plugin.name) return next(e)
-    await countSafely($, rt, work => countTool(work, e.tool))
+    await countToolSafely($, rt, e.tool)
     await touchSafely($, rt)
     if (ASKS_USER.has(e.tool)) await setWaitingSafely($, rt, true)
     try {
@@ -1361,13 +1396,15 @@ export const register: Register = on => {
     // A /clear (and an in-session /resume) keeps this process going as another conversation: block nothing.
     if (e.reason === 'clear' || e.reason === 'resume') {
       const result = await next(e)
-      const endedWork = rt.work
+      const ended: EndedRun = { work: rt.work, mcpSeen: rt.mcpSeen }
       rt.turn = { running: false, agents: [], waiting: false }
       rt.work = newWork()
+      rt.mcpSeen = []
       rt.lastSentWorking = null
       await $.state.set(TURN, rt.turn).catch(() => undefined)
       await $.state.set(WORK, rt.work).catch(() => undefined)
-      $.clock.after(0, () => void switchSessionSafely($, rt, e.sessionId, endedWork))
+      await $.state.set(MCP_SEEN, rt.mcpSeen).catch(() => undefined)
+      $.clock.after(0, () => void switchSessionSafely($, rt, e.sessionId, ended))
       return result
     }
     rt.timer?.cancel()

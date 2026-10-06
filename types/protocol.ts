@@ -58,6 +58,8 @@ export type WorkReport = {
   agentRuns: number
   /** Tool calls by tool, subagents' included: Claude Code's own by name ("Bash", "Read"), any MCP server's as "mcp", anything else as "other". */
   tools: Record<string, number>
+  /** How many different MCP servers those "mcp" calls went to; which ones never leaves the machine. */
+  mcpServers: number
   /** The session's latest measure (session.measure); null before the first. */
   measure: WorkMeasure | null
 }

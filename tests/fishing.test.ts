@@ -53,6 +53,7 @@ const NO_WORK = {
   turns: { count: 0, aborted: 0, failed: 0, ms: 0 },
   agentRuns: 0,
   tools: {},
+  mcpServers: 0,
   measure: null,
 }
 const SECRET = 'ab'.repeat(32)
@@ -849,8 +850,10 @@ describe('what Claude did', () => {
     for await (const chunk of $.turn.step({ turnId: 't1', index: 0, model: 'claude-opus-5-5', effort: 'high', messageCount: 1 })) void chunk
     await $.tool.call({ tool: 'Bash', command: 'ls' } as never)
     await $.tool.call({ tool: 'Bash', command: 'pwd' } as never)
-    // Neither the MCP server nor a plugin's tool is named, however Claude Code-like its name.
+    // Neither the MCP server nor a plugin's tool is named, however Claude Code-like its name; how many MCP servers is counted.
     await $.tool.call({ tool: 'mcp__slack__post_message', text: 'hi' } as never)
+    await $.tool.call({ tool: 'mcp__slack__read_channel' } as never)
+    await $.tool.call({ tool: 'mcp__github__create_issue' } as never)
     await $.tool.call({ tool: 'some_plugin_tool' } as never)
     await $.tool.call({ tool: 'Weather' } as never)
     w.stepUsage.next = { model: 'claude-haiku-4-5', input_tokens: 1, output_tokens: 20, cache_read_input_tokens: 0, cache_creation_input_tokens: 0 }
@@ -869,8 +872,12 @@ describe('what Claude did', () => {
       },
       turns: { count: 1, aborted: 0, failed: 0, ms: 4_000 },
       agentRuns: 1,
-      tools: { Bash: 2, mcp: 1, other: 2 },
+      tools: { Bash: 2, mcp: 3, other: 2 },
+      mcpServers: 2,
     })
+    // The servers' names stay in this session's own state.
+    expect(JSON.stringify(w.sent)).not.toMatch(/slack|github|Weather|some_plugin_tool/)
+    expect(w.state.get('mcpSeen')).toEqual(['slack', 'github'])
   })
 
   test("the latest measure rides along (context fill, plan limits, cost), and is not Claude's activity", async ($, on) => {
@@ -911,22 +918,25 @@ describe('what Claude did', () => {
       byModel: {},
       turns: { count: 1, aborted: 0, failed: 0, ms: 9 },
       agentRuns: 0,
-      tools: { Read: 2 },
+      tools: { Read: 2, mcp: 1 },
+      mcpServers: 1,
       measure: null,
     }
-    const w = world(on, { state: { work: kept } })
+    const w = world(on, { state: { work: kept, mcpSeen: ['slack'] } })
     await $.session.start(START)
     await w.clock.settle()
     expect(w.lastBeat()?.work).toEqual(kept)
     await $.tool.call({ tool: 'Read', file_path: '/x' } as never)
+    await $.tool.call({ tool: 'mcp__slack__post_message' } as never) // a server the run has seen
     await w.clock.settle()
     await $.session.end({ reason: 'clear', sessionId: 'sess-1', resume: { id: 'sess-1' } })
     await w.clock.settle()
     const [first, ending] = w.beats().slice(-2).map(b => b.body)
     expect(first).toEqual(expect.objectContaining({ sessionId: 'sess-2', work: NO_WORK }))
     expect((first!.work as { run: string }).run).not.toBe(kept.run)
-    expect(ending).toEqual(expect.objectContaining({ sessionId: 'sess-1', ending: true, work: { ...kept, tools: { Read: 3 } } }))
+    expect(ending).toEqual(expect.objectContaining({ sessionId: 'sess-1', ending: true, work: { ...kept, tools: { Read: 3, mcp: 2 } } }))
     expect(w.state.get('work')).toEqual(first!.work)
+    expect(w.state.get('mcpSeen')).toEqual([])
   })
 })
 
