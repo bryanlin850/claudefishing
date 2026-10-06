@@ -150,6 +150,8 @@ type Runtime = {
   answerPath: string | null
   /** When this session last got an answer, or took one from answer.json. */
   answeredAt: number | null
+  /** answer.json as this session last wrote or showed it: a quiet session takes it again only once it changed. */
+  answerText: string | null
   /** The plugin version an update toast was shown for (once each). */
   updateToastFor: string | null
   link: Link
@@ -602,26 +604,29 @@ async function claimKeepalive($: EngineInterface, rt: Runtime, sessionId: string
   return (await readKeepalive($, rt))?.claim === claim
 }
 
-/** The last answer any session of the machine got; null with none, or one that does not read. */
-async function readAnswer($: EngineInterface, rt: Runtime): Promise<SharedAnswer | null> {
+/** The last answer any session of the machine got, and the file's text; null with none, or one that does not read. */
+async function readAnswer($: EngineInterface, rt: Runtime): Promise<(SharedAnswer & { text: string }) | null> {
   rt.answerPath ??= `${await homeDir($)}/answer.json`
   try {
     if (!(await $.fs.exists(rt.answerPath))) return null
-    const shared = JSON.parse(await $.fs.read(rt.answerPath)) as Partial<SharedAnswer> | null
+    const text = await $.fs.read(rt.answerPath)
+    const shared = JSON.parse(text) as Partial<SharedAnswer> | null
     const answer = asHeartbeatResponse(shared?.answer)
     if (answer === null || typeof answer.serverTime !== 'number' || typeof shared?.at !== 'number' || typeof shared.modVersion !== 'string') return null
-    return { at: shared.at, modVersion: shared.modVersion, answer }
+    return { at: shared.at, modVersion: shared.modVersion, answer, text }
   } catch {
     return null
   }
 }
 
-/** Unless a newer answer is there already: two sessions' answers can land in either order. */
+/** Unless a newer answer is there already: two sessions' answers can land in either order (of two as old, the later one written stays). */
 async function shareAnswer($: EngineInterface, rt: Runtime, now: number, answer: HeartbeatResponse): Promise<void> {
   const current = await readAnswer($, rt)
-  if (current !== null && current.answer.serverTime >= answer.serverTime) return
+  if (current !== null && current.answer.serverTime > answer.serverTime) return
   rt.answerPath ??= `${await homeDir($)}/answer.json`
-  await $.fs.write(rt.answerPath, `${JSON.stringify({ at: now, modVersion: MOD_VERSION, answer } satisfies SharedAnswer)}\n`)
+  const text = `${JSON.stringify({ at: now, modVersion: MOD_VERSION, answer } satisfies SharedAnswer)}\n`
+  await $.fs.write(rt.answerPath, text)
+  rt.answerText = text
 }
 
 /** Its own keepalive while the server counts it for the buff; past that, the machine's, once no session has beaten for one. */
@@ -634,11 +639,13 @@ async function isKeepaliveDue($: EngineInterface, rt: Runtime, now: number): Pro
   return stamp?.sessionId === sessionId || claimKeepalive($, rt, sessionId, now)
 }
 
-// A quiet session shows the newest answer of the machine. With none for a session's lifetime on the
-// server, no session of the machine reaches the game: offline, as the one trying to will be.
+// A quiet session shows the newest answer of the machine: one it has not shown yet, no older than its
+// own. With none for a session's lifetime on the server, no session of the machine reaches the game:
+// offline, as the one trying to will be.
 async function followAnswer($: EngineInterface, rt: Runtime, now: number): Promise<void> {
   const shared = await readAnswer($, rt)
-  if (shared !== null && shared.answer.serverTime > (rt.last?.serverTime ?? -Infinity)) {
+  if (shared !== null && shared.text !== rt.answerText && shared.answer.serverTime >= (rt.last?.serverTime ?? -Infinity)) {
+    rt.answerText = shared.text
     // An answer to another version of the plugin says nothing about this one's updates.
     const modUpdate = shared.modVersion === MOD_VERSION ? (shared.answer.modUpdate ?? null) : (rt.last?.modUpdate ?? null)
     rt.last = { ...shared.answer, modUpdate }
@@ -1187,6 +1194,7 @@ export const register: Register = on => {
     keepalivePath: null,
     answerPath: null,
     answeredAt: null,
+    answerText: null,
     updateToastFor: null,
     link: 'unknown',
     linkError: null,
