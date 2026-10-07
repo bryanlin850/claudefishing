@@ -11,10 +11,11 @@ sessions to the game:
   session's model and effort, which also show on your nametag. Time Claude
   spends waiting on you (a permission prompt, a question, plan approval, an
   MCP form) does not count as working;
-* `/fishing open` opens the game in a chromeless Chrome window (or a tab of
-  your default browser with `CLAUDEFISHING_APP_WINDOW=0`), and the game
-  opens on its own once per session when one starts (unless
-  `CLAUDEFISHING_AUTO_OPEN=0`).
+* `/fishing open` opens the game. The first time, it asks whether you want an
+  app window (a chromeless Chrome window) or a link to open in your own
+  browser, and remembers the answer (`/fishing open app` or `/fishing open
+  browser` changes it). With the app window, the game also opens on its own
+  once per session when one starts (unless `CLAUDEFISHING_AUTO_OPEN=0`).
 
 This is a Claude Code mod: `hooks/register.ts` runs inside Claude Code.
 The game and server are hosted separately; installing the mod requires no game
@@ -76,21 +77,14 @@ would list them as "not yet set" on every install), and it only ever talks
 to https://claudefishing.io. The game opens by itself once per session when
 an interactive terminal session starts, or the desktop app or VS Code
 attaches (a phone never opens it; the server skips it while a game window is
-already connected, one was opened in the last minute, or fishing is off). To
+already connected, one was opened in the last minute, or fishing is off; and
+it never opens when you chose the browser link). To
 keep it from doing that, set `CLAUDEFISHING_AUTO_OPEN` to `0` (or `false`,
 `no`, `off`) in your shell or in the `env` block of `~/.claude/settings.json`
 (the desktop app reads the latter):
 
 ```json
 { "env": { "CLAUDEFISHING_AUTO_OPEN": "0" } }
-```
-
-On a Mac with Google Chrome, the game opens in a Chrome app window (no tabs or
-address bar). To get a normal tab of your default browser instead, set
-`CLAUDEFISHING_APP_WINDOW` to `0` the same way:
-
-```json
-{ "env": { "CLAUDEFISHING_APP_WINDOW": "0" } }
 ```
 
 Mods are enabled by default in supported Claude Code versions. Update Claude
@@ -117,7 +111,9 @@ it; when the server needs a newer one than yours, the status line says
 
 ```
 /fishing              status (same as /fishing status)
-/fishing open         open the game window (pairs this machine with it; turns fishing on if it was off)
+/fishing open         open the game (pairs this machine with it; turns fishing on if it was off)
+/fishing open app     open it in an app window, from now on
+/fishing open browser give a link to open in your own browser, from now on
 /fishing off          stop reporting from every session on this machine, and close its game window
 /fishing on           resume
 /fishing link         a one-time code for another device to play this cat
@@ -178,14 +174,13 @@ The status line shows one of:
 
 plus ` · ⚡+11%` while the buff is on.
 
-The window opens with `open -na "Google Chrome" --args --app=<url>` (a
-chromeless app window; skipped with `CLAUDEFISHING_APP_WINDOW=0`), else
-`open <url>`, else `xdg-open <url>`. The link carries a one-time pairing code;
-it works once, for two minutes. The page trades it for a token it keeps in that
-browser profile's storage, so `https://claudefishing.io` then plays directly in
-any tab or window of the same profile while a Claude Code session with the
-plugin is open. A browser or profile the link never opened in has no token and
-shows the install screen.
+The first `/fishing open` asks "App window" or "Browser link" and keeps the
+answer in the plugin's store (dismissed, or in `claude -p`, it opens the app
+window and asks again next time). The app window opens with `open -na "Google
+Chrome" --args --app=<url>` (a chromeless app window), else `open <url>`, else
+`xdg-open <url>`. The browser link is printed and copied to the clipboard
+instead, to open in whichever browser you like. Either way the link carries a
+one-time pairing code; it works once, for two minutes.
 
 ## What it sends, and what stays local
 

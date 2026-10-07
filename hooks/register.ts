@@ -45,8 +45,7 @@ import type {
 const DEFAULT_SERVER_URL = 'https://claudefishing.io' // npm run dev:sync swaps in the dev server in its copy only
 // No plugin.json userConfig: Claude Code reports declared options as "not yet set" on install, defaults or
 // not. CLAUDEFISHING_AUTO_OPEN=0 (false, no, off), from the shell or the `env` block of settings.json,
-// keeps the game from opening by itself; CLAUDEFISHING_APP_WINDOW=0 opens it in a tab of the default browser
-// instead of a Chrome app window. CLAUDEFISHING_SERVER_URL is for development and names a server
+// keeps the game from opening by itself. CLAUDEFISHING_SERVER_URL is for development and names a server
 // on this machine only: every request carries the machine's secret, and a project's settings can set
 // environment variables, so nothing in them may send it anywhere but the game.
 
@@ -85,7 +84,7 @@ const STALE_TURN_MS = 30 * 60_000
 const PROMPT_NOTIFICATION = /permission_prompt|idle_prompt|elicitation(_url)?_dialog|needs_input/
 /** Tools whose call lasts until the person answers. */
 const ASKS_USER = new Set(['AskUserQuestion', 'ExitPlanMode'])
-const USAGE = 'usage: /fishing [status|open|on|off|link [code]|unlink]'
+const USAGE = 'usage: /fishing [status|open [app|browser]|on|off|link [code]|unlink]'
 /** Models and tools a work report keeps apart: past these, a request counts in the totals only, a tool as "other". */
 const WORK_MODELS = 8
 const WORK_TOOLS = 40
@@ -115,6 +114,11 @@ const AUTO_OPEN = { plugin: 'claudefishing', key: 'autoOpen' } as const
 const WORK = { plugin: 'claudefishing', key: 'work' } as const
 const MCP_SEEN = { plugin: 'claudefishing', key: 'mcpSeen' } as const
 
+/** $.store: how /fishing open opens the game, as the person chose it the first time (or with /fishing open app|browser). */
+const OPEN_IN = 'openIn'
+/** app: a Chrome app window (else the default browser); browser: the link, to open in any browser. */
+type OpenIn = 'app' | 'browser'
+
 type Identity = { secret: string; createdAt: number }
 
 type Link = 'unknown' | 'online' | 'offline'
@@ -127,8 +131,6 @@ type Runtime = {
   serverUrl: string
   /** Open the game once per session (CLAUDEFISHING_AUTO_OPEN turns it off). */
   autoOpen: boolean
-  /** Open it in a Chrome app window when there is a Chrome (CLAUDEFISHING_APP_WINDOW turns it off: a tab of the default browser). */
-  appWindow: boolean
   /** This session acts on: reports while on; turned off it went quiet. Follows `fishing.on` within a tick. */
   enabled: boolean
   /** The machine's switch as this session last read it (the file, ~/.claudefishing/fishing.json). */
@@ -222,8 +224,7 @@ function serverUrlFrom(value: string | null | undefined): string {
   }
 }
 
-/** An on/off setting from the environment: on unless 0, false, no or off. */
-function isOnFrom(value: string | null | undefined): boolean {
+function autoOpenFrom(value: string | null | undefined): boolean {
   return !/^(0|false|no|off)$/i.test(value?.trim() ?? '')
 }
 
@@ -969,24 +970,43 @@ function restoreSeen(kept: unknown): string[] {
 
 // ─── opening the game ──────────────────────────────────────────────────────
 
-async function openUrl($: EngineInterface, url: string, appWindow: boolean): Promise<string | null> {
-  // macOS: -n so --args reach a Chrome that is already running. Then, or without the app window, the default browser's tab.
+async function openUrl($: EngineInterface, url: string): Promise<string | null> {
+  // macOS: -n so --args reach a Chrome that is already running; then the default browser.
   const tries: [argv: string[], how: string][] = [
     [['open', '-na', 'Google Chrome', '--args', `--app=${url}`], 'a Chrome app window'],
     [['open', url], 'the default browser'],
     [['xdg-open', url], 'the default browser'],
   ]
-  for (const [argv, how] of appWindow ? tries : tries.slice(1)) {
+  for (const [argv, how] of tries) {
     const result = await $.process.run(argv).catch(() => null)
     if (result?.exitCode === 0) return how
   }
   return null
 }
 
+/** How the game opens as the person chose it; null until they did (or when the store cannot be read). */
+async function loadOpenIn($: EngineInterface): Promise<OpenIn | null> {
+  const value = await $.store.get(OPEN_IN).catch(() => undefined)
+  return value === 'app' || value === 'browser' ? value : null
+}
+
+const OPEN_OPTIONS = ['App window', 'Browser link'] as const
+
+/** The first /fishing open asks; null when the question was dismissed or nobody could be asked (`claude -p`). */
+async function askOpenIn($: EngineInterface): Promise<OpenIn | null> {
+  const question = 'Open claudefishing in an app window, or get a link to open in your own browser?'
+  const answer = await $.ui.ask(question, { header: 'Open game', options: OPEN_OPTIONS }).catch(() => null)
+  if (answer === null) return null
+  // Typed under "Other" too: "app", "browser", "a link", "tab".
+  if (answer === OPEN_OPTIONS[0] || /^\s*app\b/i.test(answer)) return 'app'
+  if (answer === OPEN_OPTIONS[1] || /\b(browser|link|tab)\b/i.test(answer)) return 'browser'
+  return null
+}
+
 /** unreachable: the pair request got no answer at all (worth trying again); failed: anything else that went wrong. */
 type OpenResult = { kind: 'opened' | 'skipped' | 'failed' | 'unreachable'; text: string }
 
-async function openGame($: EngineInterface, rt: Runtime, reason: PairRequest['reason']): Promise<OpenResult> {
+async function openGame($: EngineInterface, rt: Runtime, reason: PairRequest['reason'], openIn: OpenIn): Promise<OpenResult> {
   const identity = await ensureIdentity($, rt)
   if (identity === null) return { kind: 'failed', text: `no identity file: ${rt.identityError}` }
   const request: PairRequest = { sessionId: await $.session.id(), reason }
@@ -1002,12 +1022,19 @@ async function openGame($: EngineInterface, rt: Runtime, reason: PairRequest['re
   }
   if (typeof pair.code !== 'string') return { kind: 'failed', text: 'unexpected answer from the server' }
   const url = `${rt.serverUrl}/#pair=${encodeURIComponent(pair.code)}`
-  const how = await openUrl($, url, rt.appWindow)
-  if (how === null) return { kind: 'failed', text: `could not start a browser; open ${url} yourself (the link works once, for 2 minutes)` }
+  let text: string
+  if (openIn === 'browser') {
+    const copied = (await $.ui.copy({ text: url }).catch(() => null))?.isCopied === true
+    text = `open this link in your browser${copied ? ' (copied)' : ''}; it works once, for 2 minutes:\n${url}`
+  } else {
+    const how = await openUrl($, url)
+    if (how === null) return { kind: 'failed', text: `could not start a browser; open ${url} yourself (the link works once, for 2 minutes)` }
+    text = `opened in ${how}`
+  }
   // The window takes a few seconds to load and join: until a beat's answer says it did, the line says so.
   rt.openingUntil = (await $.clock.now()) + OPENING_MS
   $.ui.status(statusLine(rt))
-  return { kind: 'opened', text: `opened in ${how}` }
+  return { kind: 'opened', text }
 }
 
 // Once per session (the terminal at start, the desktop app or VS Code when it attaches); done once the
@@ -1021,7 +1048,9 @@ async function autoOpen($: EngineInterface, rt: Runtime): Promise<void> {
       rt.isAutoOpenPending = false
       return
     }
-    const result = await openGame($, rt, 'auto')
+    // With the browser chosen there is no window to open, and a link nobody asked for would only expire.
+    const result: OpenResult =
+      (await loadOpenIn($)) === 'browser' ? { kind: 'skipped', text: 'the game opens with /fishing open' } : await openGame($, rt, 'auto', 'app')
     rt.isAutoOpenPending = result.kind === 'unreachable'
     await $.state.set(AUTO_OPEN, rt.isAutoOpenPending ? 'pending' : 'done')
     if (result.kind === 'opened') $.ui.toast(`🎣 game ${result.text}`)
@@ -1213,7 +1242,6 @@ export const register: Register = on => {
   const rt: Runtime = {
     serverUrl: DEFAULT_SERVER_URL, // session.start reads the environment
     autoOpen: true,
-    appWindow: true,
     enabled: true,
     fishing: FIRST_SWITCH,
     fishingPath: null,
@@ -1252,12 +1280,11 @@ export const register: Register = on => {
   on('session.start', async ($, e, next) => {
     await $.command.register({
       name: 'fishing',
-      description: 'claudefishing: status | open | on | off | link | unlink',
-      argumentHint: '[status|open|on|off|link [code]|unlink]',
+      description: 'claudefishing: status | open [app|browser] | on | off | link | unlink',
+      argumentHint: '[status|open [app|browser]|on|off|link [code]|unlink]',
     })
     rt.serverUrl = serverUrlFrom(await $.env.get('CLAUDEFISHING_SERVER_URL'))
-    rt.autoOpen = isOnFrom(await $.env.get('CLAUDEFISHING_AUTO_OPEN'))
-    rt.appWindow = isOnFrom(await $.env.get('CLAUDEFISHING_APP_WINDOW'))
+    rt.autoOpen = autoOpenFrom(await $.env.get('CLAUDEFISHING_AUTO_OPEN'))
     const { value: activity } = await $.state.get(ACTIVITY)
     if (activity !== undefined) rt.activity = activity
     // A reload mid-turn keeps the turn, its subagents and a prompt waiting on the person.
@@ -1382,6 +1409,18 @@ export const register: Register = on => {
       return { text: 'fishing off: no session on this machine reports to the game, and its game window closes. /fishing on resumes.' }
     }
     if (arg === 'open') {
+      const named = rest[0]?.toLowerCase()
+      if (named !== undefined && named !== 'app' && named !== 'browser') return { text: USAGE }
+      // How to open it: as named (and kept), else as chosen before, else asked (and kept). Unanswered: the app window.
+      let openIn: OpenIn | null = named ?? (await loadOpenIn($))
+      let note: string | null = null
+      if (named !== undefined || openIn === null) {
+        openIn = named ?? (await askOpenIn($))
+        if (openIn !== null && (await $.store.set(OPEN_IN, openIn).then(() => true, () => false))) {
+          const way = openIn === 'app' ? 'an app window' : 'a link for your browser'
+          note = `/fishing open gives you ${way} from now on; /fishing open app or /fishing open browser changes it.`
+        }
+      }
       // Asking for the game is asking to play: off, it would open locked. The switch, as another session may have
       // flipped it; the beat lands before the pair. The auto-open never turns fishing on.
       const wasOff = !(await loadSwitch($, rt).catch(() => rt.fishing)).on
@@ -1389,8 +1428,8 @@ export const register: Register = on => {
         const failed = await turnOn($, rt).then(() => null, errorText)
         if (failed !== null) return { text: `fishing stays off: the switch could not be saved (${failed})` }
       }
-      const result = await openGame($, rt, 'manual')
-      return { text: wasOff ? `fishing on · ${result.text}` : result.text }
+      const result = await openGame($, rt, 'manual', openIn ?? 'app')
+      return { text: [wasOff ? `fishing on · ${result.text}` : result.text, ...(note === null ? [] : [note])].join('\n') }
     }
     if (arg !== 'status') return { text: USAGE }
     await runBeat($, rt) // on: fresh numbers; off: a flip elsewhere shows

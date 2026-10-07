@@ -957,7 +957,7 @@ describe('/fishing', () => {
         'buff: ⚡+12%, 3 min left',
         'this session: model claude-opus-5-5 · effort not known until a turn runs · idle',
         `identity: ${IDENTITY} (stays on this machine)`,
-        'usage: /fishing [status|open|on|off|link [code]|unlink]',
+        'usage: /fishing [status|open [app|browser]|on|off|link [code]|unlink]',
       ].join('\n'),
     )
   })
@@ -1030,20 +1030,74 @@ describe('/fishing', () => {
     expect(w.argvs.at(-1)).toEqual(['open', 'https://claudefishing.io/#pair=K7Q2ZP'])
   })
 
-  test('open uses a tab of the default browser with CLAUDEFISHING_APP_WINDOW off, Chrome or not', async ($, on) => {
-    const w = world(on, { env: { CLAUDEFISHING_APP_WINDOW: '0' } })
+  test('the first open asks app or browser; a browser link is copied, not opened, and the choice is kept', async ($, on) => {
+    const w = world(on)
+    await $.session.start(START)
+    w.person.answer = 'Browser link'
+    const { text } = await $.command.run({ command: 'fishing', args: 'open', ...TYPED })
+    expect(w.asks).toEqual([{ question: 'Open claudefishing in an app window, or get a link to open in your own browser?', header: 'Open game', options: ['App window', 'Browser link'] }])
+    expect(text).toBe(
+      [
+        'open this link in your browser (copied); it works once, for 2 minutes:',
+        'https://claudefishing.io/#pair=K7Q2ZP',
+        '/fishing open gives you a link for your browser from now on; /fishing open app or /fishing open browser changes it.',
+      ].join('\n'),
+    )
+    expect(w.copies).toEqual(['https://claudefishing.io/#pair=K7Q2ZP'])
+    expect(w.argvs.filter(a => a[0] === 'open' || a[0] === 'xdg-open')).toEqual([])
+    expect(w.store.get('openIn')).toBe('browser')
+
+    const again = await $.command.run({ command: 'fishing', args: 'open', ...TYPED })
+    expect(w.asks).toHaveLength(1)
+    expect(again.text).toBe('open this link in your browser (copied); it works once, for 2 minutes:\nhttps://claudefishing.io/#pair=K7Q2ZP')
+  })
+
+  test('answering app window opens it and keeps the choice', async ($, on) => {
+    const w = world(on)
+    await $.session.start(START)
+    w.person.answer = 'App window'
+    const { text } = await $.command.run({ command: 'fishing', args: 'open', ...TYPED })
+    expect(text).toBe('opened in a Chrome app window\n/fishing open gives you an app window from now on; /fishing open app or /fishing open browser changes it.')
+    expect(w.store.get('openIn')).toBe('app')
+    await $.command.run({ command: 'fishing', args: 'open', ...TYPED })
+    expect(w.asks).toHaveLength(1)
+  })
+
+  test('open app or open browser changes the kept choice without asking', async ($, on) => {
+    const w = world(on, { store: { openIn: 'app' } })
+    await $.session.start(START)
+    const { text } = await $.command.run({ command: 'fishing', args: 'open Browser', ...TYPED })
+    expect(w.asks).toEqual([])
+    expect(text).toContain('https://claudefishing.io/#pair=K7Q2ZP')
+    expect(w.store.get('openIn')).toBe('browser')
+    await $.command.run({ command: 'fishing', args: 'open app', ...TYPED })
+    expect(w.argvs.at(-1)).toEqual(['open', '-na', 'Google Chrome', '--args', '--app=https://claudefishing.io/#pair=K7Q2ZP'])
+    expect(w.store.get('openIn')).toBe('app')
+  })
+
+  test('a dismissed question opens the app window and asks again next time', async ($, on) => {
+    const w = world(on)
     await $.session.start(START)
     const { text } = await $.command.run({ command: 'fishing', args: 'open', ...TYPED })
-    expect(text).toBe('opened in the default browser')
-    expect(w.argvs.filter(a => a.includes('Google Chrome'))).toEqual([])
-    expect(w.argvs.at(-1)).toEqual(['open', 'https://claudefishing.io/#pair=K7Q2ZP'])
+    expect(text).toBe('opened in a Chrome app window')
+    expect(w.store.has('openIn')).toBe(false)
+    await $.command.run({ command: 'fishing', args: 'open', ...TYPED })
+    expect(w.asks).toHaveLength(2)
+  })
+
+  test('open with another word shows the usage and opens nothing', async ($, on) => {
+    const w = world(on)
+    await $.session.start(START)
+    const { text } = await $.command.run({ command: 'fishing', args: 'open tab', ...TYPED })
+    expect(text).toBe('usage: /fishing [status|open [app|browser]|on|off|link [code]|unlink]')
+    expect(w.pairs()).toEqual([])
   })
 
   test('an unknown argument shows the usage', async ($, on) => {
     world(on)
     await $.session.start(START)
     const { text } = await $.command.run({ command: 'fishing', args: 'fly', ...TYPED })
-    expect(text).toBe('usage: /fishing [status|open|on|off|link [code]|unlink]')
+    expect(text).toBe('usage: /fishing [status|open [app|browser]|on|off|link [code]|unlink]')
   })
 })
 
@@ -1435,6 +1489,15 @@ describe('auto-open', () => {
     await $.session.attach({ surface: 'desktop', clientId: 'desktop:default' })
     await w.clock.settle()
     expect(w.pairs()).toEqual([])
+  })
+
+  test('with the browser chosen, nothing opens by itself', async ($, on) => {
+    const w = world(on, { store: { openIn: 'browser' } })
+    await $.session.start({ cwd: '/proj', surface: 'terminal', isInteractive: true })
+    await w.clock.settle()
+    expect(w.pairs()).toEqual([])
+    expect(w.argvs.filter(a => a[0] === 'open')).toEqual([])
+    expect(w.state.get('autoOpen')).toBe('done')
   })
 
   test('a skipped pair opens nothing and counts as done', async ($, on) => {
