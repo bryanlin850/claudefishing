@@ -1030,6 +1030,15 @@ describe('/fishing', () => {
     expect(w.argvs.at(-1)).toEqual(['open', 'https://claudefishing.io/#pair=K7Q2ZP'])
   })
 
+  test('open uses a tab of the default browser with CLAUDEFISHING_APP_WINDOW off, Chrome or not', async ($, on) => {
+    const w = world(on, { env: { CLAUDEFISHING_APP_WINDOW: '0' } })
+    await $.session.start(START)
+    const { text } = await $.command.run({ command: 'fishing', args: 'open', ...TYPED })
+    expect(text).toBe('opened in the default browser')
+    expect(w.argvs.filter(a => a.includes('Google Chrome'))).toEqual([])
+    expect(w.argvs.at(-1)).toEqual(['open', 'https://claudefishing.io/#pair=K7Q2ZP'])
+  })
+
   test('an unknown argument shows the usage', async ($, on) => {
     world(on)
     await $.session.start(START)

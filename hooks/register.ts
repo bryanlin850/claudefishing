@@ -45,7 +45,8 @@ import type {
 const DEFAULT_SERVER_URL = 'https://claudefishing.io' // npm run dev:sync swaps in the dev server in its copy only
 // No plugin.json userConfig: Claude Code reports declared options as "not yet set" on install, defaults or
 // not. CLAUDEFISHING_AUTO_OPEN=0 (false, no, off), from the shell or the `env` block of settings.json,
-// keeps the game from opening by itself. CLAUDEFISHING_SERVER_URL is for development and names a server
+// keeps the game from opening by itself; CLAUDEFISHING_APP_WINDOW=0 opens it in a tab of the default browser
+// instead of a Chrome app window. CLAUDEFISHING_SERVER_URL is for development and names a server
 // on this machine only: every request carries the machine's secret, and a project's settings can set
 // environment variables, so nothing in them may send it anywhere but the game.
 
@@ -126,6 +127,8 @@ type Runtime = {
   serverUrl: string
   /** Open the game once per session (CLAUDEFISHING_AUTO_OPEN turns it off). */
   autoOpen: boolean
+  /** Open it in a Chrome app window when there is a Chrome (CLAUDEFISHING_APP_WINDOW turns it off: a tab of the default browser). */
+  appWindow: boolean
   /** This session acts on: reports while on; turned off it went quiet. Follows `fishing.on` within a tick. */
   enabled: boolean
   /** The machine's switch as this session last read it (the file, ~/.claudefishing/fishing.json). */
@@ -219,7 +222,8 @@ function serverUrlFrom(value: string | null | undefined): string {
   }
 }
 
-function autoOpenFrom(value: string | null | undefined): boolean {
+/** An on/off setting from the environment: on unless 0, false, no or off. */
+function isOnFrom(value: string | null | undefined): boolean {
   return !/^(0|false|no|off)$/i.test(value?.trim() ?? '')
 }
 
@@ -965,14 +969,14 @@ function restoreSeen(kept: unknown): string[] {
 
 // ─── opening the game ──────────────────────────────────────────────────────
 
-async function openUrl($: EngineInterface, url: string): Promise<string | null> {
-  // macOS: -n so --args reach a Chrome that is already running; then the default browser.
+async function openUrl($: EngineInterface, url: string, appWindow: boolean): Promise<string | null> {
+  // macOS: -n so --args reach a Chrome that is already running. Then, or without the app window, the default browser's tab.
   const tries: [argv: string[], how: string][] = [
     [['open', '-na', 'Google Chrome', '--args', `--app=${url}`], 'a Chrome app window'],
     [['open', url], 'the default browser'],
     [['xdg-open', url], 'the default browser'],
   ]
-  for (const [argv, how] of tries) {
+  for (const [argv, how] of appWindow ? tries : tries.slice(1)) {
     const result = await $.process.run(argv).catch(() => null)
     if (result?.exitCode === 0) return how
   }
@@ -998,7 +1002,7 @@ async function openGame($: EngineInterface, rt: Runtime, reason: PairRequest['re
   }
   if (typeof pair.code !== 'string') return { kind: 'failed', text: 'unexpected answer from the server' }
   const url = `${rt.serverUrl}/#pair=${encodeURIComponent(pair.code)}`
-  const how = await openUrl($, url)
+  const how = await openUrl($, url, rt.appWindow)
   if (how === null) return { kind: 'failed', text: `could not start a browser; open ${url} yourself (the link works once, for 2 minutes)` }
   // The window takes a few seconds to load and join: until a beat's answer says it did, the line says so.
   rt.openingUntil = (await $.clock.now()) + OPENING_MS
@@ -1209,6 +1213,7 @@ export const register: Register = on => {
   const rt: Runtime = {
     serverUrl: DEFAULT_SERVER_URL, // session.start reads the environment
     autoOpen: true,
+    appWindow: true,
     enabled: true,
     fishing: FIRST_SWITCH,
     fishingPath: null,
@@ -1251,7 +1256,8 @@ export const register: Register = on => {
       argumentHint: '[status|open|on|off|link [code]|unlink]',
     })
     rt.serverUrl = serverUrlFrom(await $.env.get('CLAUDEFISHING_SERVER_URL'))
-    rt.autoOpen = autoOpenFrom(await $.env.get('CLAUDEFISHING_AUTO_OPEN'))
+    rt.autoOpen = isOnFrom(await $.env.get('CLAUDEFISHING_AUTO_OPEN'))
+    rt.appWindow = isOnFrom(await $.env.get('CLAUDEFISHING_APP_WINDOW'))
     const { value: activity } = await $.state.get(ACTIVITY)
     if (activity !== undefined) rt.activity = activity
     // A reload mid-turn keeps the turn, its subagents and a prompt waiting on the person.

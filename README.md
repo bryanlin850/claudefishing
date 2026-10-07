@@ -11,7 +11,8 @@ sessions to the game:
   session's model and effort, which also show on your nametag. Time Claude
   spends waiting on you (a permission prompt, a question, plan approval, an
   MCP form) does not count as working;
-* `/fishing open` opens the game in a chromeless Chrome window, and the game
+* `/fishing open` opens the game in a chromeless Chrome window (or a tab of
+  your default browser with `CLAUDEFISHING_APP_WINDOW=0`), and the game
   opens on its own once per session when one starts (unless
   `CLAUDEFISHING_AUTO_OPEN=0`).
 
@@ -82,6 +83,14 @@ keep it from doing that, set `CLAUDEFISHING_AUTO_OPEN` to `0` (or `false`,
 
 ```json
 { "env": { "CLAUDEFISHING_AUTO_OPEN": "0" } }
+```
+
+On a Mac with Google Chrome, the game opens in a Chrome app window (no tabs or
+address bar). To get a normal tab of your default browser instead, set
+`CLAUDEFISHING_APP_WINDOW` to `0` the same way:
+
+```json
+{ "env": { "CLAUDEFISHING_APP_WINDOW": "0" } }
 ```
 
 Mods are enabled by default in supported Claude Code versions. Update Claude
@@ -170,8 +179,13 @@ The status line shows one of:
 plus ` · ⚡+11%` while the buff is on.
 
 The window opens with `open -na "Google Chrome" --args --app=<url>` (a
-chromeless app window), else `open <url>`, else `xdg-open <url>`. The link
-carries a one-time pairing code; it works once, for two minutes.
+chromeless app window; skipped with `CLAUDEFISHING_APP_WINDOW=0`), else
+`open <url>`, else `xdg-open <url>`. The link carries a one-time pairing code;
+it works once, for two minutes. The page trades it for a token it keeps in that
+browser profile's storage, so `https://claudefishing.io` then plays directly in
+any tab or window of the same profile while a Claude Code session with the
+plugin is open. A browser or profile the link never opened in has no token and
+shows the install screen.
 
 ## What it sends, and what stays local
 
