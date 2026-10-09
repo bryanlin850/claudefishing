@@ -116,7 +116,7 @@ const MCP_SEEN = { plugin: 'claudefishing', key: 'mcpSeen' } as const
 
 /** $.store: how /fishing open opens the game, as the person chose it the first time (or with /fishing open app|browser). */
 const OPEN_IN = 'openIn'
-/** app: a Chrome app window (else the default browser); browser: the link, to open in any browser. */
+/** app: a Chrome app window (on Windows, else an Edge one; else the default browser); browser: the link, to open in any browser. */
 type OpenIn = 'app' | 'browser'
 
 type Identity = { secret: string; createdAt: number }
@@ -970,13 +970,26 @@ function restoreSeen(kept: unknown): string[] {
 
 // ─── opening the game ──────────────────────────────────────────────────────
 
+/** Windows: PowerShell's Start-Process finds `browser` as Run would (its App Paths entry), returns once it starts, and fails with no dialog when it is not there. */
+function windowsAppWindow(browser: 'chrome' | 'msedge', url: string): string[] {
+  return ['powershell.exe', '-NoProfile', '-NonInteractive', '-Command', `Start-Process ${browser} '--app=${url.replaceAll("'", "''")}'`]
+}
+
 async function openUrl($: EngineInterface, url: string): Promise<string | null> {
-  // macOS: -n so --args reach a Chrome that is already running; then the default browser.
-  const tries: [argv: string[], how: string][] = [
-    [['open', '-na', 'Google Chrome', '--args', `--app=${url}`], 'a Chrome app window'],
-    [['open', url], 'the default browser'],
-    [['xdg-open', url], 'the default browser'],
-  ]
+  const tries: [argv: string[], how: string][] =
+    (await $.env.get('OS')) === 'Windows_NT'
+      ? // Windows: a Chrome app window, else an Edge one (Edge comes with Windows), else the default browser.
+        [
+          [windowsAppWindow('chrome', url), 'a Chrome app window'],
+          [windowsAppWindow('msedge', url), 'an Edge app window'],
+          [['rundll32.exe', 'url.dll,FileProtocolHandler', url], 'the default browser'],
+        ]
+      : // macOS: -n so --args reach a Chrome that is already running; then the default browser.
+        [
+          [['open', '-na', 'Google Chrome', '--args', `--app=${url}`], 'a Chrome app window'],
+          [['open', url], 'the default browser'],
+          [['xdg-open', url], 'the default browser'],
+        ]
   for (const [argv, how] of tries) {
     const result = await $.process.run(argv).catch(() => null)
     if (result?.exitCode === 0) return how

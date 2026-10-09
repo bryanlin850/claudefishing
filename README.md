@@ -12,9 +12,9 @@ sessions to the game:
   spends waiting on you (a permission prompt, a question, plan approval, an
   MCP form) does not count as working;
 * `/fishing open` opens the game. The first time, it asks whether you want an
-  app window (a chromeless Chrome window) or a link to open in your own
-  browser, and remembers the answer (`/fishing open app` or `/fishing open
-  browser` changes it). With the app window, the game also opens on its own
+  app window (a chromeless Chrome window, or Edge on Windows without Chrome)
+  or a link to open in your own browser, and remembers the answer (`/fishing
+  open app` or `/fishing open browser` changes it). With the app window, the game also opens on its own
   once per session when one starts (unless `CLAUDEFISHING_AUTO_OPEN=0`).
 
 This is a Claude Code mod: `hooks/register.ts` runs inside Claude Code.
@@ -178,7 +178,10 @@ The first `/fishing open` asks "App window" or "Browser link" and keeps the
 answer in the plugin's store (dismissed, or in `claude -p`, it opens the app
 window and asks again next time). The app window opens with `open -na "Google
 Chrome" --args --app=<url>` (a chromeless app window), else `open <url>`, else
-`xdg-open <url>`. The browser link is printed and copied to the clipboard
+`xdg-open <url>`. On Windows it is PowerShell's `Start-Process chrome
+'--app=<url>'`, else the same with `msedge` (Edge comes with Windows), else
+`rundll32 url.dll,FileProtocolHandler <url>` (the default browser). The
+browser link is printed and copied to the clipboard
 instead, to open in whichever browser you like. Either way the link carries a
 one-time pairing code; it works once, for two minutes.
 

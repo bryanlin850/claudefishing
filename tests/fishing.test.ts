@@ -34,6 +34,8 @@ type WorldOptions = {
   /** $.state as a previous load of the module left it (a hot reload). */
   state?: Record<string, unknown>
   chromeMissing?: boolean
+  /** Windows without Edge (the Edge app window fails). */
+  edgeMissing?: boolean
   /** Each $.fs.write takes this long on the clock. */
   writeMs?: number
   /** Environment variables besides HOME. */
@@ -209,7 +211,9 @@ function world(on: On, opts: WorldOptions = {}) {
       }
     } else if (argv[0] === 'rm') {
       files.delete(argv.at(-1)!)
-    } else if (opts.chromeMissing && argv.includes('Google Chrome')) {
+    } else if (opts.chromeMissing && (argv.includes('Google Chrome') || argv.at(-1)!.startsWith('Start-Process chrome '))) {
+      exitCode = 1
+    } else if (opts.edgeMissing && argv.at(-1)!.startsWith('Start-Process msedge ')) {
       exitCode = 1
     }
     return { value: { exitCode, stdout: '', stderr: '', isStdoutTruncated: false, isStderrTruncated: false } }
@@ -1028,6 +1032,30 @@ describe('/fishing', () => {
     const { text } = await $.command.run({ command: 'fishing', args: 'open', ...TYPED })
     expect(text).toBe('opened in the default browser')
     expect(w.argvs.at(-1)).toEqual(['open', 'https://claudefishing.io/#pair=K7Q2ZP'])
+  })
+
+  test('on Windows, open makes a Chrome app window with PowerShell, never the macOS or Linux commands', async ($, on) => {
+    const w = world(on, { env: { OS: 'Windows_NT' } })
+    await $.session.start(START)
+    const { text } = await $.command.run({ command: 'fishing', args: 'open', ...TYPED })
+    expect(text).toBe('opened in a Chrome app window')
+    expect(w.argvs.at(-1)).toEqual(['powershell.exe', '-NoProfile', '-NonInteractive', '-Command', "Start-Process chrome '--app=https://claudefishing.io/#pair=K7Q2ZP'"])
+    expect(w.argvs.filter(a => a[0] === 'open' || a[0] === 'xdg-open')).toEqual([])
+  })
+
+  test('on Windows without Chrome, open makes an Edge app window', async ($, on) => {
+    const edge = world(on, { env: { OS: 'Windows_NT' }, chromeMissing: true })
+    await $.session.start(START)
+    expect((await $.command.run({ command: 'fishing', args: 'open', ...TYPED })).text).toBe('opened in an Edge app window')
+    expect(edge.argvs.at(-1)).toEqual(['powershell.exe', '-NoProfile', '-NonInteractive', '-Command', "Start-Process msedge '--app=https://claudefishing.io/#pair=K7Q2ZP'"])
+  })
+
+  test('on Windows with neither Chrome nor Edge, open hands the link to the default browser', async ($, on) => {
+    const w = world(on, { env: { OS: 'Windows_NT' }, chromeMissing: true, edgeMissing: true })
+    await $.session.start(START)
+    expect((await $.command.run({ command: 'fishing', args: 'open', ...TYPED })).text).toBe('opened in the default browser')
+    expect(w.argvs.at(-1)).toEqual(['rundll32.exe', 'url.dll,FileProtocolHandler', 'https://claudefishing.io/#pair=K7Q2ZP'])
+    expect(w.argvs.filter(a => a[0] === 'open' || a[0] === 'xdg-open')).toEqual([])
   })
 
   test('the first open asks app or browser; a browser link is copied, not opened, and the choice is kept', async ($, on) => {
