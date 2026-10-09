@@ -1,6 +1,6 @@
 {
   "name": "claudefishing",
-  "version": "0.4.1",
+  "version": "0.4.2",
   "description": "claudefishing: a shared fishing lobby you play while Claude Code is open; your cat gets a slight buff while Claude is working.",
   "author": {
     "name": "bryan"
