@@ -12,9 +12,11 @@ sessions to the game:
   spends waiting on you (a permission prompt, a question, plan approval, an
   MCP form) does not count as working;
 * `/fishing open` opens the game. The first time, it asks whether you want an
-  app window (a chromeless Chrome window, or Edge on Windows without Chrome)
-  or a link to open in your own browser, and remembers the answer (`/fishing
-  open app` or `/fishing open browser` changes it). With the app window, the game also opens on its own
+  app window (in your default browser, a window with no tabs or address bar
+  when it is Chrome, Edge or Brave) or a link to open in your own browser, and
+  remembers the answer (`/fishing open app` or `/fishing open browser` changes
+  it). `/fishing open chrome` (or `edge`, `brave`, `firefox`, `safari`) opens
+  it in that browser from then on; `/fishing open default` goes back. With the app window, the game also opens on its own
   once per session when one starts (unless `CLAUDEFISHING_AUTO_OPEN=0`).
 
 This is a Claude Code mod: `hooks/register.ts` runs inside Claude Code.
@@ -114,6 +116,8 @@ it; when the server needs a newer one than yours, the status line says
 /fishing open         open the game (pairs this machine with it; turns fishing on if it was off)
 /fishing open app     open it in an app window, from now on
 /fishing open browser give a link to open in your own browser, from now on
+/fishing open chrome  open it in Chrome (or edge, brave, firefox, safari), from now on
+/fishing open default open it in your default browser again
 /fishing off          stop reporting from every session on this machine, and close its game window
 /fishing on           resume
 /fishing link         a one-time code for another device to play this cat
@@ -176,12 +180,17 @@ plus ` · ⚡+11%` while the buff is on.
 
 The first `/fishing open` asks "App window" or "Browser link" and keeps the
 answer in the plugin's store (dismissed, or in `claude -p`, it opens the app
-window and asks again next time). The app window opens with `open -na "Google
-Chrome" --args --app=<url>` (a chromeless app window), else `open <url>`, else
-`xdg-open <url>`. On Windows it is PowerShell's `Start-Process chrome
-'--app=<url>'`, else the same with `msedge` (Edge comes with Windows), else
-`rundll32 url.dll,FileProtocolHandler <url>` (the default browser). The
-browser link is printed and copied to the clipboard
+window and asks again next time). The app window opens in the browser chosen
+with `/fishing open <browser>`, else in the system's default browser: as an
+app window (`--app=<url>`, no tabs or address bar) when that is Chrome, Edge or
+Brave, else as a plain link. On macOS the default browser is read with
+`osascript` (NSWorkspace), and the app window opens with `open -nb <bundle id>
+--args --app=<url>`; on Windows it is read from the https handler in the
+registry, and the window opens with PowerShell's `Start-Process <browser>
+'--app=<url>'`. A plain link goes to `open <url>` or `xdg-open <url>`, on
+Windows `rundll32 url.dll,FileProtocolHandler <url>`; a chosen browser that
+will not start falls back to it too. The browser link is printed and copied
+to the clipboard
 instead, to open in whichever browser you like. Either way the link carries a
 one-time pairing code; it works once, for two minutes.
 

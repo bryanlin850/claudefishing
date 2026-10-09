@@ -33,9 +33,10 @@ type WorldOptions = {
   store?: Record<string, unknown>
   /** $.state as a previous load of the module left it (a hot reload). */
   state?: Record<string, unknown>
-  chromeMissing?: boolean
-  /** Windows without Edge (the Edge app window fails). */
-  edgeMissing?: boolean
+  /** Browsers that are not installed (chrome, edge …): starting one fails. */
+  missing?: string[]
+  /** What asking for the default browser answers: a bundle id on macOS, the https handler's command on Windows. */
+  defaultBrowser?: string
   /** Each $.fs.write takes this long on the clock. */
   writeMs?: number
   /** Environment variables besides HOME. */
@@ -59,6 +60,16 @@ const NO_WORK = {
   measure: null,
 }
 const SECRET = 'ab'.repeat(32)
+const PAIR_URL = 'https://claudefishing.io/#pair=K7Q2ZP'
+/** How Windows names Chrome as the https handler. */
+const CHROME_HANDLER = '"C:\\Program Files\\Google\\Chrome\\Application\\chrome.exe" --single-argument %1'
+/** What starting each browser has in its command line, on macOS, Windows and Linux. */
+const BROWSER_MARKS: Record<string, string[]> = {
+  chrome: ['com.google.Chrome', "chrome.exe'", 'google-chrome'],
+  edge: ['com.microsoft.edgemac', "msedge.exe'", 'microsoft-edge'],
+  firefox: ['org.mozilla.firefox', "firefox.exe'", 'firefox'],
+}
+const POWERSHELL = ['powershell.exe', '-NoProfile', '-NonInteractive', '-Command']
 const TMP = /^\/home\/cat\/\.claudefishing\/identity\.json\.[0-9a-f]{12}\.tmp$/
 
 function heartbeatResponse(server: ServerState): HeartbeatResponse {
@@ -199,6 +210,7 @@ function world(on: On, opts: WorldOptions = {}) {
     const argv = [...e.argv]
     argvs.push(argv)
     let exitCode = 0
+    let stdout = ''
     if (argv[0] === 'ln') {
       // link(2): never replaces an existing file
       if (files.has(argv[2]!) || !files.has(argv[1]!)) exitCode = 1
@@ -211,12 +223,12 @@ function world(on: On, opts: WorldOptions = {}) {
       }
     } else if (argv[0] === 'rm') {
       files.delete(argv.at(-1)!)
-    } else if (opts.chromeMissing && (argv.includes('Google Chrome') || argv.at(-1)!.startsWith('Start-Process chrome '))) {
-      exitCode = 1
-    } else if (opts.edgeMissing && argv.at(-1)!.startsWith('Start-Process msedge ')) {
+    } else if (argv[0] === 'osascript' || (argv[0] === 'powershell.exe' && argv.at(-1)!.includes('UrlAssociations'))) {
+      stdout = `${opts.defaultBrowser ?? (opts.env?.OS === 'Windows_NT' ? CHROME_HANDLER : 'com.google.Chrome')}\n`
+    } else if ((opts.missing ?? []).some(name => argv.some(a => BROWSER_MARKS[name]!.some(mark => a.includes(mark))))) {
       exitCode = 1
     }
-    return { value: { exitCode, stdout: '', stderr: '', isStdoutTruncated: false, isStderrTruncated: false } }
+    return { value: { exitCode, stdout, stderr: '', isStdoutTruncated: false, isStderrTruncated: false } }
   })
   on('http.fetch', async ($, e) => {
     if (server.down) return { deny: 'ECONNREFUSED: Unable to connect' }
@@ -961,7 +973,7 @@ describe('/fishing', () => {
         'buff: ⚡+12%, 3 min left',
         'this session: model claude-opus-5-5 · effort not known until a turn runs · idle',
         `identity: ${IDENTITY} (stays on this machine)`,
-        'usage: /fishing [status|open [app|browser]|on|off|link [code]|unlink]',
+        'usage: /fishing [status|open [app|browser|default|chrome|edge|brave|firefox|safari]|on|off|link [code]|unlink]',
       ].join('\n'),
     )
   })
@@ -1005,7 +1017,7 @@ describe('/fishing', () => {
     const { text } = await $.command.run({ command: 'fishing', args: 'open', ...TYPED })
     expect(text).toBe('opened in a Chrome app window')
     expect(w.pairs()).toEqual([expect.objectContaining({ body: { sessionId: 'sess-1', reason: 'manual' }, url: 'https://claudefishing.io/api/pair' })])
-    expect(w.argvs.at(-1)).toEqual(['open', '-na', 'Google Chrome', '--args', '--app=https://claudefishing.io/#pair=K7Q2ZP'])
+    expect(w.argvs.at(-1)).toEqual(['open', '-nb', 'com.google.Chrome', '--args', `--app=${PAIR_URL}`])
   })
 
   test('open turns fishing on first when it is off, so the game does not open locked', async ($, on) => {
@@ -1027,35 +1039,80 @@ describe('/fishing', () => {
   })
 
   test('open falls back to the default browser without Chrome', async ($, on) => {
-    const w = world(on, { chromeMissing: true })
+    const w = world(on, { missing: ['chrome'] })
     await $.session.start(START)
     const { text } = await $.command.run({ command: 'fishing', args: 'open', ...TYPED })
     expect(text).toBe('opened in the default browser')
     expect(w.argvs.at(-1)).toEqual(['open', 'https://claudefishing.io/#pair=K7Q2ZP'])
   })
 
-  test('on Windows, open makes a Chrome app window with PowerShell, never the macOS or Linux commands', async ($, on) => {
+  test('open uses the default browser: an app window in Edge, a plain open in Safari', async ($, on) => {
+    const edge = world(on, { defaultBrowser: 'com.microsoft.edgemac' })
+    await $.session.start(START)
+    expect((await $.command.run({ command: 'fishing', args: 'open', ...TYPED })).text).toBe('opened in an Edge app window')
+    expect(edge.argvs.at(-1)).toEqual(['open', '-nb', 'com.microsoft.edgemac', '--args', `--app=${PAIR_URL}`])
+  })
+
+  test('open hands the link to the system when the default browser makes no app windows', async ($, on) => {
+    const w = world(on, { defaultBrowser: 'com.apple.Safari' })
+    await $.session.start(START)
+    expect((await $.command.run({ command: 'fishing', args: 'open', ...TYPED })).text).toBe('opened in the default browser')
+    expect(w.argvs.at(-1)).toEqual(['open', PAIR_URL])
+  })
+
+  test('on Windows, open makes an app window in the default browser with PowerShell, never the macOS or Linux commands', async ($, on) => {
     const w = world(on, { env: { OS: 'Windows_NT' } })
     await $.session.start(START)
     const { text } = await $.command.run({ command: 'fishing', args: 'open', ...TYPED })
     expect(text).toBe('opened in a Chrome app window')
-    expect(w.argvs.at(-1)).toEqual(['powershell.exe', '-NoProfile', '-NonInteractive', '-Command', "Start-Process chrome '--app=https://claudefishing.io/#pair=K7Q2ZP'"])
-    expect(w.argvs.filter(a => a[0] === 'open' || a[0] === 'xdg-open')).toEqual([])
+    expect(w.argvs.at(-1)).toEqual([...POWERSHELL, `Start-Process 'C:\\Program Files\\Google\\Chrome\\Application\\chrome.exe' '--app=${PAIR_URL}'`])
+    expect(w.argvs.filter(a => a[0] === 'open' || a[0] === 'xdg-open' || a[0] === 'osascript')).toEqual([])
   })
 
-  test('on Windows without Chrome, open makes an Edge app window', async ($, on) => {
-    const edge = world(on, { env: { OS: 'Windows_NT' }, chromeMissing: true })
+  for (const [why, defaultBrowser] of [['makes no app windows', '"C:\\Program Files\\Mozilla Firefox\\firefox.exe" -osint -url "%1"'], ['cannot be read', '']]) {
+    test(`on Windows, a default browser that ${why} gets the link with rundll32`, async ($, on) => {
+      const w = world(on, { env: { OS: 'Windows_NT' }, defaultBrowser })
+      await $.session.start(START)
+      expect((await $.command.run({ command: 'fishing', args: 'open', ...TYPED })).text).toBe('opened in the default browser')
+      expect(w.argvs.at(-1)).toEqual(['rundll32.exe', 'url.dll,FileProtocolHandler', PAIR_URL])
+    })
+  }
+
+  test('open <browser> keeps that browser for every open after; open default goes back', async ($, on) => {
+    const w = world(on, { store: { openIn: 'browser' } })
     await $.session.start(START)
-    expect((await $.command.run({ command: 'fishing', args: 'open', ...TYPED })).text).toBe('opened in an Edge app window')
-    expect(edge.argvs.at(-1)).toEqual(['powershell.exe', '-NoProfile', '-NonInteractive', '-Command', "Start-Process msedge '--app=https://claudefishing.io/#pair=K7Q2ZP'"])
+    const { text } = await $.command.run({ command: 'fishing', args: 'open Edge', ...TYPED })
+    expect(text).toBe('opened in an Edge app window\nthe game opens in Edge from now on; /fishing open default goes back to your default browser.')
+    expect(w.argvs.at(-1)).toEqual(['open', '-nb', 'com.microsoft.edgemac', '--args', `--app=${PAIR_URL}`])
+    expect(w.argvs.filter(a => a[0] === 'osascript')).toEqual([]) // a browser chosen: the default is not asked for
+    expect(w.store.get('openWith')).toBe('edge')
+    expect(w.store.get('openIn')).toBe('app') // naming a browser means opening it, not the link
+    await $.command.run({ command: 'fishing', args: 'open', ...TYPED })
+    expect(w.argvs.at(-1)).toEqual(['open', '-nb', 'com.microsoft.edgemac', '--args', `--app=${PAIR_URL}`])
+    const back = await $.command.run({ command: 'fishing', args: 'open default', ...TYPED })
+    expect(back.text).toBe('opened in a Chrome app window\nthe game opens in your default browser from now on.')
+    expect(w.store.has('openWith')).toBe(false)
   })
 
-  test('on Windows with neither Chrome nor Edge, open hands the link to the default browser', async ($, on) => {
-    const w = world(on, { env: { OS: 'Windows_NT' }, chromeMissing: true, edgeMissing: true })
+  test('open firefox opens a plain Firefox window', async ($, on) => {
+    const w = world(on)
     await $.session.start(START)
-    expect((await $.command.run({ command: 'fishing', args: 'open', ...TYPED })).text).toBe('opened in the default browser')
-    expect(w.argvs.at(-1)).toEqual(['rundll32.exe', 'url.dll,FileProtocolHandler', 'https://claudefishing.io/#pair=K7Q2ZP'])
-    expect(w.argvs.filter(a => a[0] === 'open' || a[0] === 'xdg-open')).toEqual([])
+    expect((await $.command.run({ command: 'fishing', args: 'open firefox', ...TYPED })).text).toContain('opened in Firefox\n')
+    expect(w.argvs.at(-1)).toEqual(['open', '-b', 'org.mozilla.firefox', PAIR_URL])
+  })
+
+  test('on Windows, open firefox starts Firefox with PowerShell', async ($, on) => {
+    const w = world(on, { env: { OS: 'Windows_NT' } })
+    await $.session.start(START)
+    expect((await $.command.run({ command: 'fishing', args: 'open firefox', ...TYPED })).text).toContain('opened in Firefox\n')
+    expect(w.argvs.at(-1)).toEqual([...POWERSHELL, `Start-Process 'firefox.exe' '${PAIR_URL}'`])
+  })
+
+  test('a chosen browser that will not start gives way to the default browser, and says so', async ($, on) => {
+    const w = world(on, { store: { openIn: 'app', openWith: 'edge' }, missing: ['edge'] })
+    await $.session.start(START)
+    expect((await $.command.run({ command: 'fishing', args: 'open', ...TYPED })).text).toBe('opened in the default browser (Edge did not open)')
+    expect(w.argvs.at(-1)).toEqual(['open', PAIR_URL])
   })
 
   test('the first open asks app or browser; a browser link is copied, not opened, and the choice is kept', async ($, on) => {
@@ -1099,7 +1156,7 @@ describe('/fishing', () => {
     expect(text).toContain('https://claudefishing.io/#pair=K7Q2ZP')
     expect(w.store.get('openIn')).toBe('browser')
     await $.command.run({ command: 'fishing', args: 'open app', ...TYPED })
-    expect(w.argvs.at(-1)).toEqual(['open', '-na', 'Google Chrome', '--args', '--app=https://claudefishing.io/#pair=K7Q2ZP'])
+    expect(w.argvs.at(-1)).toEqual(['open', '-nb', 'com.google.Chrome', '--args', `--app=${PAIR_URL}`])
     expect(w.store.get('openIn')).toBe('app')
   })
 
@@ -1117,7 +1174,7 @@ describe('/fishing', () => {
     const w = world(on)
     await $.session.start(START)
     const { text } = await $.command.run({ command: 'fishing', args: 'open tab', ...TYPED })
-    expect(text).toBe('usage: /fishing [status|open [app|browser]|on|off|link [code]|unlink]')
+    expect(text).toBe('usage: /fishing [status|open [app|browser|default|chrome|edge|brave|firefox|safari]|on|off|link [code]|unlink]')
     expect(w.pairs()).toEqual([])
   })
 
@@ -1125,7 +1182,7 @@ describe('/fishing', () => {
     world(on)
     await $.session.start(START)
     const { text } = await $.command.run({ command: 'fishing', args: 'fly', ...TYPED })
-    expect(text).toBe('usage: /fishing [status|open [app|browser]|on|off|link [code]|unlink]')
+    expect(text).toBe('usage: /fishing [status|open [app|browser|default|chrome|edge|brave|firefox|safari]|on|off|link [code]|unlink]')
   })
 })
 
@@ -1468,7 +1525,7 @@ describe('auto-open', () => {
     await $.session.attach({ surface: 'desktop', clientId: 'desktop:2' })
     await w.clock.settle()
     expect(w.pairs()).toEqual([expect.objectContaining({ body: { sessionId: 'sess-1', reason: 'auto' } })])
-    expect(w.argvs.filter(a => a[0] === 'open')).toEqual([['open', '-na', 'Google Chrome', '--args', '--app=https://claudefishing.io/#pair=K7Q2ZP']])
+    expect(w.argvs.filter(a => a[0] === 'open')).toEqual([['open', '-nb', 'com.google.Chrome', '--args', `--app=${PAIR_URL}`]])
     expect(w.toasts).toEqual(['🎣 game opened in a Chrome app window'])
     expect(w.statuses.at(-1)).toBe('🎣 opening game')
   })
