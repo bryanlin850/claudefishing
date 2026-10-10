@@ -35,8 +35,10 @@ type WorldOptions = {
   state?: Record<string, unknown>
   /** Browsers that are not installed (chrome, edge …): starting one fails. */
   missing?: string[]
-  /** What asking for the default browser answers: a bundle id on macOS, the https handler's command on Windows. */
+  /** What asking for the default browser answers: a bundle id on macOS, the https handler's command on Windows, a .desktop file on Linux. */
   defaultBrowser?: string
+  /** A Linux machine: no osascript or open; xdg-settings names the default browser. */
+  linux?: boolean
   /** Each $.fs.write takes this long on the clock. */
   writeMs?: number
   /** Environment variables besides HOME. */
@@ -223,6 +225,10 @@ function world(on: On, opts: WorldOptions = {}) {
       }
     } else if (argv[0] === 'rm') {
       files.delete(argv.at(-1)!)
+    } else if (opts.linux && (argv[0] === 'osascript' || argv[0] === 'open')) {
+      exitCode = 127 // not on Linux
+    } else if (argv[0] === 'xdg-settings') {
+      stdout = `${opts.defaultBrowser ?? 'google-chrome.desktop'}\n`
     } else if (argv[0] === 'osascript' || (argv[0] === 'powershell.exe' && argv.at(-1)!.includes('UrlAssociations'))) {
       stdout = `${opts.defaultBrowser ?? (opts.env?.OS === 'Windows_NT' ? CHROME_HANDLER : 'com.google.Chrome')}\n`
     } else if ((opts.missing ?? []).some(name => argv.some(a => BROWSER_MARKS[name]!.some(mark => a.includes(mark))))) {
@@ -1077,6 +1083,27 @@ describe('/fishing', () => {
       expect(w.argvs.at(-1)).toEqual(['rundll32.exe', 'url.dll,FileProtocolHandler', PAIR_URL])
     })
   }
+
+  test('on Linux, open reads the default browser with xdg-settings and starts its app window in the background', async ($, on) => {
+    const w = world(on, { linux: true })
+    await $.session.start(START)
+    expect((await $.command.run({ command: 'fishing', args: 'open', ...TYPED })).text).toBe('opened in a Chrome app window')
+    expect(w.argvs.at(-1)).toEqual(['sh', '-c', expect.stringContaining('wait "$pid"'), 'google-chrome', `--app=${PAIR_URL}`])
+  })
+
+  test('on Linux, a default browser that makes no app windows gets the link with xdg-open', async ($, on) => {
+    const w = world(on, { linux: true, defaultBrowser: 'firefox.desktop' })
+    await $.session.start(START)
+    expect((await $.command.run({ command: 'fishing', args: 'open', ...TYPED })).text).toBe('opened in the default browser')
+    expect(w.argvs.at(-1)).toEqual(['xdg-open', PAIR_URL])
+  })
+
+  test('on Linux, a default app-window browser that will not start gives way to xdg-open', async ($, on) => {
+    const w = world(on, { linux: true, missing: ['chrome'] })
+    await $.session.start(START)
+    expect((await $.command.run({ command: 'fishing', args: 'open', ...TYPED })).text).toBe('opened in the default browser')
+    expect(w.argvs.at(-1)).toEqual(['xdg-open', PAIR_URL])
+  })
 
   test('open <browser> keeps that browser for every open after; open default goes back', async ($, on) => {
     const w = world(on, { store: { openIn: 'browser' } })

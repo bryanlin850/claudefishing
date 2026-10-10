@@ -187,7 +187,9 @@ Brave, else as a plain link. On macOS the default browser is read with
 `osascript` (NSWorkspace), and the app window opens with `open -nb <bundle id>
 --args --app=<url>`; on Windows it is read from the https handler in the
 registry, and the window opens with PowerShell's `Start-Process <browser>
-'--app=<url>'`. A plain link goes to `open <url>` or `xdg-open <url>`, on
+'--app=<url>'`; on Linux it is read with `xdg-settings get
+default-web-browser`, and the browser starts in the background (one that
+quits with an error within a second counts as not opening). A plain link goes to `open <url>` or `xdg-open <url>`, on
 Windows `rundll32 url.dll,FileProtocolHandler <url>`; a chosen browser that
 will not start falls back to it too. The browser link is printed and copied
 to the clipboard

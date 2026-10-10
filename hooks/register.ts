@@ -1014,6 +1014,8 @@ const MAC_DEFAULT_BROWSER =
   "ObjC.import('AppKit'); var app = $.NSWorkspace.sharedWorkspace.URLForApplicationToOpenURL($.NSURL.URLWithString('https://claudefishing.io')); " +
   "app.isNil() ? '' : ObjC.unwrap($.NSBundle.bundleWithURL(app).bundleIdentifier)"
 
+const LINUX_LAUNCH = 'command -v "$0" >/dev/null || exit 1; "$0" "$@" >/dev/null 2>&1 & pid=$!; sleep 1; kill -0 "$pid" 2>/dev/null || wait "$pid"'
+
 /** `browser` opening the link: an app window when it makes them. `exe`: its program on Windows, as the default browser names it. */
 function launches(browser: Browser, url: string, windows: boolean, exe?: string): Launch[] {
   const how = browser.app ? `${/^[AEIOU]/.test(browser.name) ? 'an' : 'a'} ${browser.name} app window` : browser.name
@@ -1025,27 +1027,38 @@ function launches(browser: Browser, url: string, windows: boolean, exe?: string)
   return [
     // macOS: -n so --args reach a browser that is already running.
     { argv: browser.app ? ['open', '-nb', browser.mac, '--args', ...args] : ['open', '-b', browser.mac, url], how },
-    // Linux: started in the background, so the call returns; a program that is not there fails.
-    ...(browser.linux === null ? [] : [{ argv: ['sh', '-c', 'command -v "$0" >/dev/null || exit 1; "$0" "$@" >/dev/null 2>&1 &', browser.linux, ...args], how }]),
+    // Linux: started in the background, so the call returns. One that is not there, or ends with an
+    // error within a second, fails; still running, or handed to a running browser (exit 0), it opened.
+    ...(browser.linux === null ? [] : [{ argv: ['sh', '-c', LINUX_LAUNCH, browser.linux, ...args], how }]),
   ]
 }
 
 /** The system's default browser among BROWSERS (and its program on Windows); null when it is another one or cannot be told. */
-async function defaultBrowser($: EngineInterface, windows: boolean): Promise<{ browser: Browser; exe?: string } | null> {
-  const argv = windows ? powershell(WINDOWS_DEFAULT_BROWSER) : ['osascript', '-l', 'JavaScript', '-e', MAC_DEFAULT_BROWSER]
+/** What `argv` printed, trimmed; null when it could not run or failed. */
+async function answerOf($: EngineInterface, argv: string[]): Promise<string | null> {
   const result = await $.process.run(argv).catch(() => null)
-  if (result?.exitCode !== 0) return null
-  const answer = result.stdout.trim()
+  return result?.exitCode === 0 ? result.stdout.trim() : null
+}
+
+async function defaultBrowser($: EngineInterface, windows: boolean): Promise<{ browser: Browser; exe?: string } | null> {
+  const find = (match: (b: Browser) => boolean) => Object.values(BROWSERS).find(match) ?? null
   if (windows) {
     // "C:\Program Files\Google\Chrome\Application\chrome.exe" --single-argument %1
-    const match = /^"([^"]+)"|^(\S+)/.exec(answer)
+    const match = /^"([^"]+)"|^(\S+)/.exec((await answerOf($, powershell(WINDOWS_DEFAULT_BROWSER))) ?? '')
     const exe = match?.[1] ?? match?.[2]
     const name = exe?.split('\\').pop()?.toLowerCase()
-    const browser = Object.values(BROWSERS).find(b => b.windows === name)
-    return browser === undefined ? null : { browser, exe }
+    const browser = find(b => b.windows === name)
+    return browser === null ? null : { browser, exe }
   }
-  const browser = Object.values(BROWSERS).find(b => b.mac.toLowerCase() === answer.toLowerCase())
-  return browser === undefined ? null : { browser }
+  // macOS answers with a bundle id. Elsewhere there is no osascript, and xdg-settings names the browser's .desktop file.
+  const bundle = await answerOf($, ['osascript', '-l', 'JavaScript', '-e', MAC_DEFAULT_BROWSER])
+  if (bundle !== null) {
+    const browser = find(b => b.mac.toLowerCase() === bundle.toLowerCase())
+    return browser === null ? null : { browser }
+  }
+  const desktop = await answerOf($, ['xdg-settings', 'get', 'default-web-browser'])
+  const browser = desktop === null ? null : find(b => `${b.linux}.desktop` === desktop)
+  return browser === null ? null : { browser }
 }
 
 /** The browser /fishing open was told to use (/fishing open chrome …); null: the system's default. */
