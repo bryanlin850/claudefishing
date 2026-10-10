@@ -84,7 +84,7 @@ const STALE_TURN_MS = 30 * 60_000
 const PROMPT_NOTIFICATION = /permission_prompt|idle_prompt|elicitation(_url)?_dialog|needs_input/
 /** Tools whose call lasts until the person answers. */
 const ASKS_USER = new Set(['AskUserQuestion', 'ExitPlanMode'])
-const USAGE = 'usage: /fishing [status|open [app|browser]|on|off|link [code]|unlink]'
+const USAGE = 'usage: /fishing [status|open [app|browser|default|chrome|edge|brave|firefox|safari]|on|off|link [code]|unlink]'
 /** Models and tools a work report keeps apart: past these, a request counts in the totals only, a tool as "other". */
 const WORK_MODELS = 8
 const WORK_TOOLS = 40
@@ -116,7 +116,9 @@ const MCP_SEEN = { plugin: 'claudefishing', key: 'mcpSeen' } as const
 
 /** $.store: how /fishing open opens the game, as the person chose it the first time (or with /fishing open app|browser). */
 const OPEN_IN = 'openIn'
-/** app: a Chrome app window (else the default browser); browser: the link, to open in any browser. */
+/** $.store: the browser the game opens in (/fishing open chrome, edge …); absent, the system's default browser. */
+const OPEN_WITH = 'openWith'
+/** app: opened in a browser (an app window when it makes them); browser: the link, to open in any browser. */
 type OpenIn = 'app' | 'browser'
 
 type Identity = { secret: string; createdAt: number }
@@ -970,16 +972,119 @@ function restoreSeen(kept: unknown): string[] {
 
 // ─── opening the game ──────────────────────────────────────────────────────
 
-async function openUrl($: EngineInterface, url: string): Promise<string | null> {
-  // macOS: -n so --args reach a Chrome that is already running; then the default browser.
-  const tries: [argv: string[], how: string][] = [
-    [['open', '-na', 'Google Chrome', '--args', `--app=${url}`], 'a Chrome app window'],
-    [['open', url], 'the default browser'],
-    [['xdg-open', url], 'the default browser'],
+/** A browser /fishing open can be told to use. `app`: it makes app windows (--app, a window with no tabs or address bar). */
+type Browser = { name: string; app: boolean; mac: string; windows: string | null; linux: string | null }
+
+const BROWSERS = {
+  chrome: { name: 'Chrome', app: true, mac: 'com.google.Chrome', windows: 'chrome.exe', linux: 'google-chrome' },
+  edge: { name: 'Edge', app: true, mac: 'com.microsoft.edgemac', windows: 'msedge.exe', linux: 'microsoft-edge' },
+  brave: { name: 'Brave', app: true, mac: 'com.brave.Browser', windows: 'brave.exe', linux: 'brave-browser' },
+  firefox: { name: 'Firefox', app: false, mac: 'org.mozilla.firefox', windows: 'firefox.exe', linux: 'firefox' },
+  safari: { name: 'Safari', app: false, mac: 'com.apple.Safari', windows: null, linux: null },
+} as const satisfies Record<string, Browser>
+
+type BrowserId = keyof typeof BROWSERS
+
+function isBrowserId(value: unknown): value is BrowserId {
+  return typeof value === 'string' && Object.hasOwn(BROWSERS, value)
+}
+
+/** One way of opening the link, and what the reply calls it. */
+type Launch = { argv: string[]; how: string }
+
+/** A PowerShell string literal. */
+function psQuote(text: string): string {
+  return `'${text.replaceAll("'", "''")}'`
+}
+
+/** Windows: Start-Process returns once the browser starts, finds a bare name as Run would (App Paths), and fails with no dialog. */
+function powershell(command: string): string[] {
+  return ['powershell.exe', '-NoProfile', '-NonInteractive', '-Command', command]
+}
+
+// The https handler the person picked (UserChoiceLatest on newer Windows 11), and the command it opens links with.
+const WINDOWS_DEFAULT_BROWSER = [
+  "$k = 'HKCU:\\Software\\Microsoft\\Windows\\Shell\\Associations\\UrlAssociations\\https\\'",
+  "$id = 'UserChoiceLatest\\ProgId', 'UserChoiceLatest', 'UserChoice' | ForEach-Object { (Get-ItemProperty -LiteralPath ($k + $_) -ErrorAction SilentlyContinue).ProgId } | Where-Object { $_ } | Select-Object -First 1",
+  "if ($id) { (Get-ItemProperty -LiteralPath ('Registry::HKEY_CLASSES_ROOT\\' + $id + '\\shell\\open\\command') -ErrorAction SilentlyContinue).'(default)' }",
+].join('; ')
+
+// macOS: the app links open in, by its bundle id (Safari when nobody changed it).
+const MAC_DEFAULT_BROWSER =
+  "ObjC.import('AppKit'); var app = $.NSWorkspace.sharedWorkspace.URLForApplicationToOpenURL($.NSURL.URLWithString('https://claudefishing.io')); " +
+  "app.isNil() ? '' : ObjC.unwrap($.NSBundle.bundleWithURL(app).bundleIdentifier)"
+
+const LINUX_LAUNCH = 'command -v "$0" >/dev/null || exit 1; "$0" "$@" >/dev/null 2>&1 & pid=$!; sleep 1; kill -0 "$pid" 2>/dev/null || wait "$pid"'
+
+/** `browser` opening the link: an app window when it makes them. `exe`: its program on Windows, as the default browser names it. */
+function launches(browser: Browser, url: string, windows: boolean, exe?: string): Launch[] {
+  const how = browser.app ? `${/^[AEIOU]/.test(browser.name) ? 'an' : 'a'} ${browser.name} app window` : browser.name
+  const args = browser.app ? [`--app=${url}`] : [url]
+  if (windows) {
+    const program = exe ?? browser.windows
+    return program === null ? [] : [{ argv: powershell(`Start-Process ${psQuote(program)} ${psQuote(args[0]!)}`), how }]
+  }
+  return [
+    // macOS: -n so --args reach a browser that is already running.
+    { argv: browser.app ? ['open', '-nb', browser.mac, '--args', ...args] : ['open', '-b', browser.mac, url], how },
+    // Linux: started in the background, so the call returns. One that is not there, or ends with an
+    // error within a second, fails; still running, or handed to a running browser (exit 0), it opened.
+    ...(browser.linux === null ? [] : [{ argv: ['sh', '-c', LINUX_LAUNCH, browser.linux, ...args], how }]),
   ]
-  for (const [argv, how] of tries) {
+}
+
+/** The system's default browser among BROWSERS (and its program on Windows); null when it is another one or cannot be told. */
+/** What `argv` printed, trimmed; null when it could not run or failed. */
+async function answerOf($: EngineInterface, argv: string[]): Promise<string | null> {
+  const result = await $.process.run(argv).catch(() => null)
+  return result?.exitCode === 0 ? result.stdout.trim() : null
+}
+
+async function defaultBrowser($: EngineInterface, windows: boolean): Promise<{ browser: Browser; exe?: string } | null> {
+  const find = (match: (b: Browser) => boolean) => Object.values(BROWSERS).find(match) ?? null
+  if (windows) {
+    // "C:\Program Files\Google\Chrome\Application\chrome.exe" --single-argument %1
+    const match = /^"([^"]+)"|^(\S+)/.exec((await answerOf($, powershell(WINDOWS_DEFAULT_BROWSER))) ?? '')
+    const exe = match?.[1] ?? match?.[2]
+    const name = exe?.split('\\').pop()?.toLowerCase()
+    const browser = find(b => b.windows === name)
+    return browser === null ? null : { browser, exe }
+  }
+  // macOS answers with a bundle id. Elsewhere there is no osascript, and xdg-settings names the browser's .desktop file.
+  const bundle = await answerOf($, ['osascript', '-l', 'JavaScript', '-e', MAC_DEFAULT_BROWSER])
+  if (bundle !== null) {
+    const browser = find(b => b.mac.toLowerCase() === bundle.toLowerCase())
+    return browser === null ? null : { browser }
+  }
+  const desktop = await answerOf($, ['xdg-settings', 'get', 'default-web-browser'])
+  const browser = desktop === null ? null : find(b => `${b.linux}.desktop` === desktop)
+  return browser === null ? null : { browser }
+}
+
+/** The browser /fishing open was told to use (/fishing open chrome …); null: the system's default. */
+async function loadOpenWith($: EngineInterface): Promise<BrowserId | null> {
+  const value = await $.store.get(OPEN_WITH).catch(() => undefined)
+  return isBrowserId(value) ? value : null
+}
+
+async function openUrl($: EngineInterface, url: string): Promise<string | null> {
+  const windows = (await $.env.get('OS')) === 'Windows_NT'
+  const chosen = await loadOpenWith($)
+  const found = chosen === null ? await defaultBrowser($, windows) : null
+  // The browser chosen, else the default one (an app window when it makes them); either missing, the link handed to the system.
+  const tries: Launch[] = [
+    ...(chosen !== null ? launches(BROWSERS[chosen], url, windows) : []),
+    ...(found !== null && found.browser.app ? launches(found.browser, url, windows, found.exe) : []),
+    ...(windows
+      ? [{ argv: ['rundll32.exe', 'url.dll,FileProtocolHandler', url], how: 'the default browser' }]
+      : [
+          { argv: ['open', url], how: 'the default browser' },
+          { argv: ['xdg-open', url], how: 'the default browser' },
+        ]),
+  ]
+  for (const { argv, how } of tries) {
     const result = await $.process.run(argv).catch(() => null)
-    if (result?.exitCode === 0) return how
+    if (result?.exitCode === 0) return chosen !== null && how === 'the default browser' ? `the default browser (${BROWSERS[chosen].name} did not open)` : how
   }
   return null
 }
@@ -1409,16 +1514,26 @@ export const register: Register = on => {
       return { text: 'fishing off: no session on this machine reports to the game, and its game window closes. /fishing on resumes.' }
     }
     if (arg === 'open') {
-      const named = rest[0]?.toLowerCase()
+      let named = rest[0]?.toLowerCase()
+      let note: string | null = null
+      // A browser named (or the default one again): kept for every open after, and it means the game is opened for you.
+      if (named === 'default' || isBrowserId(named)) {
+        const kept = await (named === 'default' ? $.store.delete(OPEN_WITH) : $.store.set(OPEN_WITH, named)).then(() => true, () => false)
+        if (kept) {
+          note = named === 'default'
+            ? 'the game opens in your default browser from now on.'
+            : `the game opens in ${BROWSERS[named].name} from now on; /fishing open default goes back to your default browser.`
+        }
+        named = 'app'
+      }
       if (named !== undefined && named !== 'app' && named !== 'browser') return { text: USAGE }
       // How to open it: as named (and kept), else as chosen before, else asked (and kept). Unanswered: the app window.
       let openIn: OpenIn | null = named ?? (await loadOpenIn($))
-      let note: string | null = null
       if (named !== undefined || openIn === null) {
         openIn = named ?? (await askOpenIn($))
         if (openIn !== null && (await $.store.set(OPEN_IN, openIn).then(() => true, () => false))) {
           const way = openIn === 'app' ? 'an app window' : 'a link for your browser'
-          note = `/fishing open gives you ${way} from now on; /fishing open app or /fishing open browser changes it.`
+          note ??= `/fishing open gives you ${way} from now on; /fishing open app or /fishing open browser changes it.`
         }
       }
       // Asking for the game is asking to play: off, it would open locked. The switch, as another session may have
