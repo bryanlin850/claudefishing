@@ -273,8 +273,9 @@ Nothing else: no prompts, answers, code, file names, tool inputs or paths.
 
 ## Development
 
-Use Node.js 24 LTS and install the development tools (including a local,
-pinned Claude Code binary):
+Use Node.js 24 LTS (`.node-version` names the release CI uses, 24.22.1, the
+October 2026 security release) and install the development tools (including a
+local, pinned Claude Code binary):
 
 ```sh
 npm ci
